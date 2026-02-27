@@ -101,7 +101,7 @@ class CarController(CarControllerBase):
         counter = (msg['COUNTER'] + 1) % 16
         can_sends.append(create_resume_acc(self.packer, counter, status, msg))
 
-    can_sends.append(create_lka_steering(self.packer, CC.latActive, apply_angle, self.status))
+    can_sends.append(create_lka_steering(self.packer, CC.latActive, apply_angle, self.status, CS.out.gearShifter))
     self.apply_angle_last = apply_angle
 
     new_actuators = actuators.as_builder()

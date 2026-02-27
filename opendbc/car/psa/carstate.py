@@ -61,7 +61,11 @@ class CarState(CarStateBase):
     if bool(cp_cam.vl['Dat_BSI']['P103_Com_bRevGear']):
       ret.gearShifter = GearShifter.reverse
     else:
-      ret.gearShifter = GearShifter.drive
+      # DRIVE and BRAKE are encoded in BUS 2 under LKA DRIVE
+      if(cp_cam.vl['LANE_KEEP_ASSIST']['DRIVE'] == 0):
+        ret.gearShifter = GearShifter.drive
+      elif(cp_cam.vl['LANE_KEEP_ASSIST']['DRIVE'] == 1):
+        ret.gearShifter = GearShifter.brake
 
     # blinkers
     blinker = cp_cam.vl['HS2_DAT7_BSI_612']['CDE_CLG_ET_HDC']
