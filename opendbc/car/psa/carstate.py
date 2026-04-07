@@ -61,7 +61,11 @@ class CarState(CarStateBase):
     if bool(cp_cam.vl['Dat_BSI']['P103_Com_bRevGear']):
       ret.gearShifter = GearShifter.reverse
     else:
+      # Both D and B are forward-driving gears; always report drive so openpilot stays enabled
       ret.gearShifter = GearShifter.drive
+
+    # Store raw DRIVE signal to echo back on CAN (0: D, 1: B/brake mode)
+    self.lka_drive_mode = int(cp_cam.vl['LANE_KEEP_ASSIST']['DRIVE'])
 
     # blinkers
     blinker = cp_cam.vl['HS2_DAT7_BSI_612']['CDE_CLG_ET_HDC']

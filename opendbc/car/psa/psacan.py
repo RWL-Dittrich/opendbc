@@ -9,9 +9,10 @@ def psa_checksum(address: int, sig, d: bytearray) -> int:
   return (chk_ini - checksum) & 0xF
 
 
-def create_lka_steering(packer, lat_active: bool, apply_angle: float, status: int):
+def create_lka_steering(packer, lat_active: bool, apply_angle: float, status: int, lka_drive_mode: int):
+  # DRIVE 0 means normal D mode, 1 means B (brake) mode — echo raw value from car
   values = {
-    'DRIVE': 1,
+    'DRIVE': lka_drive_mode,
     'STATUS': status,
     'LXA_ACTIVATION': 1,
     'TORQUE_FACTOR': lat_active * 100,

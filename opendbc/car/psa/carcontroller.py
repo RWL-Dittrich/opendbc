@@ -52,7 +52,8 @@ class CarController(CarControllerBase):
 
     # torque lookup
     ACCEL_LOOKUP = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
-    TORQUE_LOOKUP = [-400, -300, 120, 350, 550, 800, 1000]
+    # TORQUE_LOOKUP = [-400, -100, 150, 400, 700, 900, 1000]
+    TORQUE_LOOKUP = [-400, -300, 150, 400, 700, 900, 1000]
 
     # calculate Torque
     torque_nm = interp(accel_cmd, ACCEL_LOOKUP, TORQUE_LOOKUP)
@@ -101,7 +102,7 @@ class CarController(CarControllerBase):
         counter = (msg['COUNTER'] + 1) % 16
         can_sends.append(create_resume_acc(self.packer, counter, status, msg))
 
-    can_sends.append(create_lka_steering(self.packer, CC.latActive, apply_angle, self.status))
+    can_sends.append(create_lka_steering(self.packer, CC.latActive, apply_angle, self.status, CS.lka_drive_mode))
     self.apply_angle_last = apply_angle
 
     new_actuators = actuators.as_builder()
