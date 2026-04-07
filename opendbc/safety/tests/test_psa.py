@@ -52,8 +52,8 @@ class TestPsaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
     return self.packer.make_can_msg_safety("Dat_BSI", self.CAM_BUS, values)
 
   def _user_gas_msg(self, gas):
-    values = {"P002_Com_rAPP": int(gas * 100)}
-    return self.packer.make_can_msg_safety("Dyn_CMM", self.MAIN_BUS, values)
+    values = {"GAS_PEDAL": int(gas * 100)}
+    return self.packer.make_can_msg_panda("DRIVER", self.CAM_BUS, values)
 
   def test_rx_hook(self):
     # speed
