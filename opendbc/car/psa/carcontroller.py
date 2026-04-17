@@ -1,6 +1,6 @@
 from opendbc.can.packer import CANPacker
 from opendbc.car import Bus, structs, make_tester_present_msg
-from opendbc.car.lateral import apply_std_steer_angle_limits
+from opendbc.car.lateral import apply_center_deadzone, apply_std_steer_angle_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.psa.psacan import create_lka_steering, create_resume_acc, create_disable_radar, create_HS2_DYN1_MDD_ETAT_2B6, create_HS2_DYN_MDD_ETAT_2F6
 from opendbc.car.psa.values import CarControllerParams
@@ -29,7 +29,15 @@ class CarController(CarControllerBase):
     # stopping = actuators.longControlState == LongCtrlState.stopping
 
     # lateral control
-    apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
+    apply_angle = actuators.steeringAngleDeg
+
+    # suppress steering oscillation at low speeds (up to 5 m/s)
+    # small angle corrections within a deadzone are filtered out to prevent EPS hunting
+    if CC.latActive and CS.out.vEgoRaw < 5.0:
+      deadzone = interp(CS.out.vEgoRaw, [0.5, 5.0], [6.0, 3.0])
+      apply_angle = self.apply_angle_last + apply_center_deadzone(apply_angle - self.apply_angle_last, deadzone)
+
+    apply_angle = apply_std_steer_angle_limits(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
                                                  CS.out.steeringAngleDeg, CC.latActive, CarControllerParams.ANGLE_LIMITS)
 
     # EPS disengages on steering override, activation sequence 2->3->4 to re-engage
