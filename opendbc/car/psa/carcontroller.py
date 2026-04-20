@@ -34,7 +34,7 @@ class CarController(CarControllerBase):
     # suppress steering oscillation at low speeds (up to 5 m/s)
     # small angle corrections within a deadzone are filtered out to prevent EPS hunting
     if CC.latActive and CS.out.vEgoRaw < 5.0:
-      deadzone = interp(CS.out.vEgoRaw, [0.5, 5.0], [6.0, 3.0])
+      deadzone = interp(CS.out.vEgoRaw, [0.5, 5.0], [4.0, 2.0])
       apply_angle = self.apply_angle_last + apply_center_deadzone(apply_angle - self.apply_angle_last, deadzone)
 
     apply_angle = apply_std_steer_angle_limits(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
