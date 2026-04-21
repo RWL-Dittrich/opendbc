@@ -1,6 +1,6 @@
 from opendbc.can.packer import CANPacker
-from opendbc.car import Bus, structs, make_tester_present_msg
-from opendbc.car.lateral import apply_center_deadzone, apply_std_steer_angle_limits
+from opendbc.car import Bus, DT_CTRL, structs, make_tester_present_msg
+from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.psa.psacan import create_lka_steering, create_resume_acc, create_disable_radar, create_HS2_DYN1_MDD_ETAT_2B6, create_HS2_DYN_MDD_ETAT_2F6
 from opendbc.car.psa.values import CarControllerParams
@@ -17,6 +17,8 @@ class CarController(CarControllerBase):
     super().__init__(dbc_names, CP, CP_SP)
     self.packer = CANPacker(dbc_names[Bus.main])
     self.apply_angle_last = 0
+    self.lat_active_last = False
+    self.engage_frame = 0
     self.radar_disabled = 0
     self.status = 2
     self.bars = 4
@@ -31,11 +33,23 @@ class CarController(CarControllerBase):
     # lateral control
     apply_angle = actuators.steeringAngleDeg
 
-    # suppress steering oscillation at low speeds (up to 5 m/s)
-    # small angle corrections within a deadzone are filtered out to prevent EPS hunting
+    # smooth engagement: blend from current wheel angle to commanded angle over ~0.5s
+    # on rising edge of latActive to avoid a lunge when the initial command is far from the wheel
+    ENGAGE_FRAMES = 50
+    if CC.latActive and not self.lat_active_last:
+      self.engage_frame = 0
+    if CC.latActive and self.engage_frame < ENGAGE_FRAMES:
+      self.engage_frame += 1
+      blend = self.engage_frame / ENGAGE_FRAMES
+      apply_angle = blend * apply_angle + (1 - blend) * CS.out.steeringAngleDeg
+    self.lat_active_last = CC.latActive
+
+    # low-pass filter at low speeds to suppress high-frequency jitter from sensor
+    # quantization and controller gain, without introducing a dead-band discontinuity
     if CC.latActive and CS.out.vEgoRaw < 5.0:
-      deadzone = interp(CS.out.vEgoRaw, [0.5, 5.0], [4.0, 2.0])
-      apply_angle = self.apply_angle_last + apply_center_deadzone(apply_angle - self.apply_angle_last, deadzone)
+      tau = interp(CS.out.vEgoRaw, [0.5, 5.0], [0.3, 0.1])
+      alpha = 1 - math.exp(-DT_CTRL / tau)
+      apply_angle = alpha * apply_angle + (1 - alpha) * self.apply_angle_last
 
     apply_angle = apply_std_steer_angle_limits(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
                                                  CS.out.steeringAngleDeg, CC.latActive, CarControllerParams.ANGLE_LIMITS)
