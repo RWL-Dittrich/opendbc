@@ -33,9 +33,9 @@ class CarController(CarControllerBase):
     # lateral control
     apply_angle = actuators.steeringAngleDeg
 
-    # smooth engagement: blend from current wheel angle to commanded angle over ~0.5s
+    # smooth engagement: blend from current wheel angle to commanded angle over ~1.0s
     # on rising edge of latActive to avoid a lunge when the initial command is far from the wheel
-    ENGAGE_FRAMES = 50
+    ENGAGE_FRAMES = 100
     if CC.latActive and not self.lat_active_last:
       self.engage_frame = 0
     if CC.latActive and self.engage_frame < ENGAGE_FRAMES:
@@ -44,8 +44,9 @@ class CarController(CarControllerBase):
       apply_angle = blend * apply_angle + (1 - blend) * CS.out.steeringAngleDeg
     self.lat_active_last = CC.latActive
 
-    # low-pass filter at low speeds to suppress high-frequency jitter from sensor
-    # quantization and controller gain, without introducing a dead-band discontinuity
+    # low-pass filter at low speeds to suppress high-frequency jitter at low speeds.
+    # the reason for this happening is unknown, but it may be related to the EPS torque sensor noise or quantization.
+    # the filter time constant is reduced as speed increases to avoid excessive delay at higher speeds.
     if CC.latActive and CS.out.vEgoRaw < 5.0:
       tau = interp(CS.out.vEgoRaw, [0.5, 5.0], [0.3, 0.1])
       alpha = 1 - math.exp(-DT_CTRL / tau)
