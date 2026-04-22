@@ -1,5 +1,5 @@
 from opendbc.can.packer import CANPacker
-from opendbc.car import Bus, structs, make_tester_present_msg
+from opendbc.car import Bus, DT_CTRL, structs, make_tester_present_msg
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.psa.psacan import create_lka_steering, create_resume_acc, create_disable_radar, create_HS2_DYN1_MDD_ETAT_2B6, create_HS2_DYN_MDD_ETAT_2F6
@@ -17,6 +17,8 @@ class CarController(CarControllerBase):
     super().__init__(dbc_names, CP, CP_SP)
     self.packer = CANPacker(dbc_names[Bus.main])
     self.apply_angle_last = 0
+    self.lat_active_last = False
+    self.engage_frame = 0
     self.radar_disabled = 0
     self.status = 2
     self.bars = 4
@@ -29,7 +31,28 @@ class CarController(CarControllerBase):
     # stopping = actuators.longControlState == LongCtrlState.stopping
 
     # lateral control
-    apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
+    apply_angle = actuators.steeringAngleDeg
+
+    # smooth engagement: blend from current wheel angle to commanded angle over ~1.0s
+    # on rising edge of latActive to avoid a lunge when the initial command is far from the wheel
+    ENGAGE_FRAMES = 100
+    if CC.latActive and not self.lat_active_last:
+      self.engage_frame = 0
+    if CC.latActive and self.engage_frame < ENGAGE_FRAMES:
+      self.engage_frame += 1
+      blend = self.engage_frame / ENGAGE_FRAMES
+      apply_angle = blend * apply_angle + (1 - blend) * CS.out.steeringAngleDeg
+    self.lat_active_last = CC.latActive
+
+    # low-pass filter at low speeds to suppress high-frequency jitter at low speeds.
+    # the reason for this happening is unknown, but it may be related to the EPS torque sensor noise or quantization.
+    # the filter time constant is reduced as speed increases to avoid excessive delay at higher speeds.
+    if CC.latActive and CS.out.vEgoRaw < 5.0:
+      tau = interp(CS.out.vEgoRaw, [0.5, 5.0], [0.3, 0.1])
+      alpha = 1 - math.exp(-DT_CTRL / tau)
+      apply_angle = alpha * apply_angle + (1 - alpha) * self.apply_angle_last
+
+    apply_angle = apply_std_steer_angle_limits(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
                                                  CS.out.steeringAngleDeg, CC.latActive, CarControllerParams.ANGLE_LIMITS)
 
     # EPS disengages on steering override, activation sequence 2->3->4 to re-engage
@@ -88,7 +111,8 @@ class CarController(CarControllerBase):
       # Lowest brake mode accel seen: -4.85m/s²
 
       if self.frame % 2 == 0:
-        can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, CS.out.cruiseState.enabled, CS.out.gasPressed, braking, CS.out.brakePressed, CS.out.standstill, torque))
+        can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, CS.out.cruiseState.enabled,
+                                                      CS.out.gasPressed, braking, CS.out.brakePressed, CS.out.standstill, torque))
         can_sends.append(create_HS2_DYN_MDD_ETAT_2F6(self.packer, braking, CC.hudControl.leadVisible, self.bars))
 
     # stock long
