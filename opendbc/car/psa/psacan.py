@@ -34,7 +34,8 @@ def create_drive_away_request(packer, hs2_dyn_mdd_etat_2f6):
 
 
 # Radar, 50 Hz
-def create_HS2_DYN1_MDD_ETAT_2B6(packer, frame: int, accel: float, enabled: bool, gasPressed: bool, braking: bool, brakePressed: bool, standstill: bool, torque: int):
+def create_HS2_DYN1_MDD_ETAT_2B6(packer, frame: int, accel: float, enabled: bool, gasPressed: bool,
+                                 braking: bool, brakePressed: bool, standstill: bool, torque: int):
   # TODO: if gas pressed, ACC_STATUS is set to suspended and decel can be set negative (about -300 Nm / -0.6m/s²) with brake mode inactive
   # TODO: tune torque multiplier
   # TODO: check difference between GMP_POTENTIAL_WHEEL_TORQUE and GMP_WHEEL_TORQUE

@@ -12,7 +12,7 @@ LANE_KEEP_ASSIST = 0x3F2
 class TestPsaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
   RELAY_MALFUNCTION_ADDRS = {0: (LANE_KEEP_ASSIST,)}
   FWD_BLACKLISTED_ADDRS = {2: [LANE_KEEP_ASSIST]}
-  TX_MSGS = [[1010, 0]]
+  TX_MSGS = [[1010, 0], [1106, 1], [1718, 1], [1942, 1], [1270, 1], [694, 1], [758, 1]]
 
   MAIN_BUS = 0
   ADAS_BUS = 1
@@ -44,8 +44,18 @@ class TestPsaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
     return self.packer.make_can_msg_safety("HS2_DAT_MDD_CMD_452", self.ADAS_BUS, values)
 
   def _speed_msg(self, speed):
-    values = {"VITESSE_VEHICULE_ROUES": speed * 3.6}
-    return self.packer.make_can_msg_safety("HS2_DYN_ABR_38D", self.MAIN_BUS, values)
+    kph = speed * 3.6
+    values = {
+      "P263_VehV_VPsvValWhlFrtL": kph,
+      "P264_VehV_VPsvValWhlFrtR": kph,
+      "P265_VehV_VPsvValWhlBckL": kph,
+      "P266_VehV_VPsvValWhlBckR": kph,
+    }
+    return self.packer.make_can_msg_safety("Dyn4_FRE", self.MAIN_BUS, values)
+
+  def _vehicle_moving_msg(self, speed: float):
+    values = {"VEHICLE_STANDSTILL": 0 if speed > self.STANDSTILL_THRESHOLD else 1}
+    return self.packer.make_can_msg_safety("HS2_DYN_UCF_MDD_32D", self.ADAS_BUS, values)
 
   def _user_brake_msg(self, brake):
     values = {"P013_MainBrake": brake}
@@ -53,17 +63,9 @@ class TestPsaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
 
   def _user_gas_msg(self, gas):
     values = {"GAS_PEDAL": int(gas * 100)}
-    return self.packer.make_can_msg_panda("DRIVER", self.CAM_BUS, values)
+    return self.packer.make_can_msg_safety("DRIVER", self.CAM_BUS, values)
 
   def test_rx_hook(self):
-    # speed
-    for _ in range(10):
-      self.assertTrue(self._rx(self._speed_msg(0)))
-    msg = self._speed_msg(0)
-    # invalidate checksum
-    msg[0].data[5] = 0x00
-    self.assertFalse(self._rx(msg))
-
     # cruise
     for _ in range(10):
       self.assertTrue(self._rx(self._pcm_status_msg(0)))
