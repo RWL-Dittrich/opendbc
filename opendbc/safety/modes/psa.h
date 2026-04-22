@@ -7,7 +7,6 @@
 #define PSA_DRIVER                1390U // RX from XXX, gas pedal
 #define PSA_DYN4_FRE              781U  // RX from CDS, wheel speeds
 #define PSA_HS2_DYN_UCF_MDD_32D   813U  // RX from UC_FREIN, standstill
-#define PSA_HS2_DYN_ABR_38D       909U  // RX from UC_FREIN, speed
 #define PSA_HS2_DAT_MDD_CMD_452   1106U // RX from BSI, cruise state
 #define PSA_DAT_BSI               1042U // RX from BSI, brake
 #define PSA_LANE_KEEP_ASSIST      1010U // TX from OP,  EPS
@@ -28,8 +27,6 @@ static uint8_t psa_get_counter(const CANPacket_t *msg) {
   uint8_t cnt = 0;
   if (msg->addr == PSA_HS2_DAT_MDD_CMD_452) {
     cnt = (msg->data[3] >> 4) & 0xFU;
-  } else if (msg->addr == PSA_HS2_DYN_ABR_38D) {
-    cnt = (msg->data[5] >> 4) & 0xFU;
   } else {
   }
   return cnt;
@@ -59,8 +56,6 @@ static uint32_t psa_compute_checksum(const CANPacket_t *msg) {
   uint8_t chk = 0;
   if (msg->addr == PSA_HS2_DAT_MDD_CMD_452) {
     chk = _psa_compute_checksum(msg, 0x4, 5);
-  } else if (msg->addr == PSA_HS2_DYN_ABR_38D) {
-    chk = _psa_compute_checksum(msg, 0x7, 5);
   } else {
   }
   return chk;
