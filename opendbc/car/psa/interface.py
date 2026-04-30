@@ -18,7 +18,7 @@ class CarInterface(CarInterfaceBase):
 
     ret.dashcamOnly = False
 
-    ret.steerActuatorDelay = 0.3
+    ret.steerActuatorDelay = 0.35
     ret.steerLimitTimer = 0.1
     ret.steerAtStandstill = True
 
