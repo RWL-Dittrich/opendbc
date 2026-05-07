@@ -36,7 +36,7 @@ class PSAPlatformConfig(PlatformConfig):
 class CAR(Platforms):
   PSA_PEUGEOT_208 = PSAPlatformConfig(
     [PSACarDocs("Peugeot 208 2019-25")],
-    CarSpecs(mass=1530, wheelbase=2.54, steerRatio=17.9),
+    CarSpecs(mass=1530, wheelbase=2.54, steerRatio=18.3),
   )
   PSA_PEUGEOT_508 = PSAPlatformConfig(
     [PSACarDocs("Peugeot 508 2019-23")],
