@@ -47,8 +47,8 @@ class CarController(CarControllerBase):
     # low-pass filter at low speeds to suppress high-frequency jitter at low speeds.
     # the reason for this happening is unknown, but it may be related to the EPS torque sensor noise or quantization.
     # the filter time constant is reduced as speed increases to avoid excessive delay at higher speeds.
-    if CC.latActive and CS.out.vEgoRaw < 5.0:
-      tau = interp(CS.out.vEgoRaw, [0.5, 5.0], [0.3, 0.1])
+    if CC.latActive and CS.out.vEgoRaw < 3.0:
+      tau = interp(CS.out.vEgoRaw, [0.5, 3.0], [0.3, 0.1])
       alpha = 1 - math.exp(-DT_CTRL / tau)
       apply_angle = alpha * apply_angle + (1 - alpha) * self.apply_angle_last
 
