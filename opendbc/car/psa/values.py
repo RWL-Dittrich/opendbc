@@ -14,8 +14,8 @@ class CarControllerParams:
 
   ANGLE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
     390, # deg
-    ([0., 5., 25.], [1.75, 1., .15]),
-    ([0., 5., 25.], [2.5, 1., .15]),
+    ([0., 5., 25.], [0.5, 0.3, .04]),
+    ([0., 5., 25.], [1., .4, .06]),
   )
   STEER_DRIVER_ALLOWANCE = 5  # Driver intervention threshold, 0.5 Nm
 
