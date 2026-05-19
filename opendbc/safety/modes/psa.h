@@ -111,7 +111,7 @@ static bool psa_tx_hook(const CANPacket_t *msg) {
     },
     .angle_rate_down_lookup = {
       {0., 5., 25.},
-      {2., .1, .15},
+      {2., 1.0, .15},
     },
   };
 
