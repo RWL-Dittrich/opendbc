@@ -1,15 +1,27 @@
 from opendbc.can.packer import CANPacker
 from opendbc.car import Bus, DT_CTRL, structs, make_tester_present_msg
-from opendbc.car.lateral import apply_std_steer_angle_limits
+from opendbc.car.lateral import apply_steer_angle_limits_vm
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.psa.psacan import create_lka_steering, create_resume_acc, create_disable_radar, create_HS2_DYN1_MDD_ETAT_2B6, create_HS2_DYN_MDD_ETAT_2F6
 from opendbc.car.psa.values import CarControllerParams
+from opendbc.car.vehicle_model import VehicleModel
 from numpy import interp
-from cereal import messaging
 import math
 
+try:
+  from cereal import messaging
+  sm = messaging.SubMaster(['modelV2'], poll='modelV2')
+except ImportError:
+  # cereal is only available in openpilot, not in standalone opendbc
+  sm = None
+
 LongCtrlState = structs.CarControl.Actuators.LongControlState
-sm = messaging.SubMaster(['modelV2'], poll='modelV2')
+
+
+def get_safety_CP():
+  # We use the PSA_PEUGEOT_208 platform for lateral limiting to match safety
+  from opendbc.car.psa.interface import CarInterface
+  return CarInterface.get_non_essential_params("PSA_PEUGEOT_208")
 
 
 class CarController(CarControllerBase):
@@ -22,6 +34,9 @@ class CarController(CarControllerBase):
     self.radar_disabled = 0
     self.status = 2
     self.bars = 4
+
+    # Vehicle model used for lateral limiting
+    self.VM = VehicleModel(get_safety_CP())
 
   def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
@@ -52,8 +67,8 @@ class CarController(CarControllerBase):
       alpha = 1 - math.exp(-DT_CTRL / tau)
       apply_angle = alpha * apply_angle + (1 - alpha) * self.apply_angle_last
 
-    apply_angle = apply_std_steer_angle_limits(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
-                                                 CS.out.steeringAngleDeg, CC.latActive, CarControllerParams.ANGLE_LIMITS)
+    apply_angle = apply_steer_angle_limits_vm(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
+                                              CS.out.steeringAngleDeg, CC.latActive, CarControllerParams, self.VM)
 
     # EPS disengages on steering override, activation sequence 2->3->4 to re-engage
     # STATUS  -  0: UNAVAILABLE, 1: UNSELECTED, 2: READY, 3: AUTHORIZED, 4: ACTIVE

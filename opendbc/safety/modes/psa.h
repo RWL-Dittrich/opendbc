@@ -103,16 +103,16 @@ static void psa_rx_hook(const CANPacket_t *msg) {
 static bool psa_tx_hook(const CANPacket_t *msg) {
   bool tx = true;
   static const AngleSteeringLimits PSA_STEERING_LIMITS = {
-    .max_angle = 3900,
+    .max_angle = 3900,  // 390 deg
     .angle_deg_to_can = 10,
-    .angle_rate_up_lookup = {
-      {0., 5., 25.},
-      {1.5, 0.6, .1},
-    },
-    .angle_rate_down_lookup = {
-      {0., 5., 25.},
-      {2., 1.0, .15},
-    },
+    .frequency = 100U,
+  };
+
+  // NOTE: based off PSA_PEUGEOT_208 to match openpilot
+  static const AngleSteeringParams PSA_STEERING_PARAMS = {
+    .slip_factor = -0.0006603474685883592,  // calc_slip_factor(VM)
+    .steer_ratio = 18.3,
+    .wheelbase = 2.54,
   };
 
   // Safety check for LKA
@@ -122,7 +122,7 @@ static bool psa_tx_hook(const CANPacket_t *msg) {
     // TORQUE_FACTOR
     bool lka_active = ((msg->data[5] & 0xFEU) >> 1) == 100U;
 
-    if (steer_angle_cmd_checks(desired_angle, lka_active, PSA_STEERING_LIMITS)) {
+    if (steer_angle_cmd_checks_vm(desired_angle, lka_active, PSA_STEERING_LIMITS, PSA_STEERING_PARAMS)) {
       tx = false;
     }
   }
