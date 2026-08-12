@@ -9,7 +9,11 @@ from numpy import interp
 import math
 
 try:
-  from cereal import messaging
+  try:
+    # sunnypilot packages cereal under the openpilot namespace
+    from openpilot.cereal import messaging
+  except ImportError:
+    from cereal import messaging
   sm = messaging.SubMaster(['modelV2'], poll='modelV2')
 except ImportError:
   # cereal is only available in openpilot, not in standalone opendbc
@@ -98,7 +102,7 @@ class CarController(CarControllerBase):
 
     braking = accel_cmd < brake_accel and not CS.out.gasPressed
     if self.CP.openpilotLongitudinalControl:
-      if CC.hudControl.leadVisible:
+      if CC.hudControl.leadVisible and sm is not None:
         sm.update(0)
         leads_v3 = sm['modelV2'].leadsV3
         if leads_v3 and leads_v3[0].x:
@@ -109,7 +113,7 @@ class CarController(CarControllerBase):
             self.bars = min(3, self.bars + 1)
           elif r < self.bars - 0.2:
             self.bars = max(0, self.bars - 1)
-      else:
+      elif not CC.hudControl.leadVisible:
         self.bars = 4
 
       # disable radar ECU by setting to programming mode
