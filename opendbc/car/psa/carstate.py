@@ -8,8 +8,20 @@ from opendbc.car.interfaces import CarStateBase
 GearShifter = structs.CarState.GearShifter
 TransmissionType = structs.CarParams.TransmissionType
 
+# Radar ECU (ARTIV) message used to tell whether the stock radar is still on the bus.
+RADAR_MSG = 'HS2_DYN1_MDD_ETAT_2B6'
+# 0x2B6 is 50 Hz and update() runs at 100 Hz. The ESP (UC_FREIN) marks its ACC
+# fields invalid after ~150 ms without it, so notice comfortably before that.
+RADAR_TIMEOUT_FRAMES = 15
+
 
 class CarState(CarStateBase):
+  def __init__(self, CP, CP_SP):
+    super().__init__(CP, CP_SP)
+    self.radar_alive = False
+    self.radar_last_ts = 0
+    self.radar_stale_frames = 0
+
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.main]
     cp_adas = can_parsers[Bus.adas]
@@ -57,6 +69,17 @@ class CarState(CarStateBase):
     # resume request
     self.hs2_dat_mdd_cmd_452 = copy.copy(cp_adas.vl['HS2_DAT_MDD_CMD_452'])
 
+    # Is the stock radar ECU still transmitting? Our own emulated 0x2B6 comes back
+    # as a TX echo on src 129, which this parser drops, so this only ever tracks the
+    # real ECU. Compare timestamps rather than clocks so this stays replay-safe.
+    radar_ts = cp_adas.ts_nanos[RADAR_MSG]['COUNTER']
+    if radar_ts != self.radar_last_ts:
+      self.radar_last_ts = radar_ts
+      self.radar_stale_frames = 0
+    else:
+      self.radar_stale_frames += 1
+    self.radar_alive = radar_ts != 0 and self.radar_stale_frames < RADAR_TIMEOUT_FRAMES
+
     # gear
     if bool(cp_cam.vl['Dat_BSI']['P103_Com_bRevGear']):
       ret.gearShifter = GearShifter.reverse
@@ -81,6 +104,8 @@ class CarState(CarStateBase):
   def get_can_parsers(CP, CP_SP):
     return {
       Bus.main: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
-      Bus.adas: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1),
+      # nan frequency: openpilot longitudinal deliberately silences the radar ECU,
+      # so a missing 0x2B6 must not invalidate the ADAS bus
+      Bus.adas: CANParser(DBC[CP.carFingerprint][Bus.pt], [(RADAR_MSG, float('nan'))], 1),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
     }

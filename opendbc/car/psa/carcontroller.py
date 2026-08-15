@@ -10,6 +10,16 @@ import math
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 
+# pandad leaves the panda in ELM327 mode until card publishes CarParams, measured
+# at 20-174 ms after the first control frame across 20 logged drives. The radar
+# knockout goes to a diagnostic address, which ELM327 lets through, but the
+# emulated 0x2B6/0x2F6 that take the radar's place are rejected until the switch
+# to the PSA safety mode lands. Knocking the radar out inside that window leaves
+# the ADAS bus silent, and the ESP (UC_FREIN) marks its ACC fields invalid after
+# ~150 ms of silence, which openpilot then reports as accFaulted. Hold off well
+# past the worst measured delay before touching the radar.
+RADAR_DISABLE_FRAME = 100  # 1.0 s
+
 
 def get_safety_CP():
   # We use the PSA_PEUGEOT_208 platform for lateral limiting to match safety
@@ -24,7 +34,8 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0
     self.lat_active_last = False
     self.engage_frame = 0
-    self.radar_disabled = 0
+    self.radar_disable_sent = False
+    self.radar_disabled = False
     self.status = 2
     self.bars = 4
 
@@ -104,23 +115,27 @@ class CarController(CarControllerBase):
       else:
         self.bars = 4
 
-      # disable radar ECU by setting to programming mode
-      if self.radar_disabled == 0:
-        can_sends.append(create_disable_radar())
-        self.radar_disabled = 1
+      # disable radar ECU by setting to programming mode, see RADAR_DISABLE_FRAME
+      if not self.radar_disabled:
+        if not self.radar_disable_sent and self.frame >= RADAR_DISABLE_FRAME:
+          can_sends.append(create_disable_radar())
+          self.radar_disable_sent = True
+        # only start emulating once the real radar has actually gone quiet, two
+        # ECUs transmitting 0x2B6 at once would collide on the bus
+        self.radar_disabled = self.radar_disable_sent and not CS.radar_alive
+      else:
+        # keep radar ECU disabled by sending tester present
+        if self.frame % 100 == 0:
+          can_sends.append(make_tester_present_msg(0x6b6, 1, suppress_response=False))
 
-      # keep radar ECU disabled by sending tester present
-      if self.frame % 100 == 0 and self.frame>0: # TODO check if disable_radar is sent 100 frames before
-        can_sends.append(make_tester_present_msg(0x6b6, 1, suppress_response=False))
+        # Highest torque seen without gas input: ~1000
+        # Lowest torque seen without break mode: -560 (but only when transitioning from brake to accel mode, else -248)
+        # Lowest brake mode accel seen: -4.85m/s²
 
-      # Highest torque seen without gas input: ~1000
-      # Lowest torque seen without break mode: -560 (but only when transitioning from brake to accel mode, else -248)
-      # Lowest brake mode accel seen: -4.85m/s²
-
-      if self.frame % 2 == 0:
-        can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, CS.out.cruiseState.enabled,
-                                                      CS.out.gasPressed, braking, CS.out.brakePressed, CS.out.standstill, torque))
-        can_sends.append(create_HS2_DYN_MDD_ETAT_2F6(self.packer, braking, CC.hudControl.leadVisible, self.bars))
+        if self.frame % 2 == 0:
+          can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, CS.out.cruiseState.enabled,
+                                                        CS.out.gasPressed, braking, CS.out.brakePressed, CS.out.standstill, torque))
+          can_sends.append(create_HS2_DYN_MDD_ETAT_2F6(self.packer, braking, CC.hudControl.leadVisible, self.bars))
 
     # stock long
     # emulate resume button every 3 seconds to prevent autohold timeout
