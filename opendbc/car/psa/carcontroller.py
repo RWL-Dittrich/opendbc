@@ -26,6 +26,13 @@ RADAR_DISABLE_FRAME = 100  # 1.0 s
 # 0x2B6 reappears, so this only bounds the case where it never does.
 RADAR_ENABLE_TIMEOUT_FRAMES = 200  # 2.0 s
 
+# CMM (the engine ECU) takes a wheel-torque request, not an acceleration, so this map is
+# the conversion the stock radar would have done. Calibrated against measured accel from
+# the LongitudinalManeuverMode suite — see helper-scripts/accel_map.py, which imports
+# these directly so its suggestions can never be against a stale copy.
+ACCEL_LOOKUP = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]     # m/s²
+TORQUE_LOOKUP = [-400, -300, 120, 350, 645, 862, 1000]   # N.m
+
 
 def get_safety_CP():
   # We use the PSA_PEUGEOT_208 platform for lateral limiting to match safety
@@ -117,10 +124,6 @@ class CarController(CarControllerBase):
 
     brake_accel = -0.5
 
-    # torque lookup
-    ACCEL_LOOKUP = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
-    TORQUE_LOOKUP = [-400, -300, 120, 350, 550, 800, 1000]
-
     # calculate Torque
     torque_nm = interp(accel_cmd, ACCEL_LOOKUP, TORQUE_LOOKUP)
     torque = max(-400, min(torque_nm, 1000))
@@ -166,9 +169,18 @@ class CarController(CarControllerBase):
       # Lowest torque seen without break mode: -560 (but only when transitioning from brake to accel mode, else -248)
       # Lowest brake mode accel seen: -4.85m/s²
 
+      # The PCM keeps cruiseState.enabled up for ~80 ms after the driver takes over, but
+      # controlsd zeroes actuators.accel the moment longActive drops. Keying the emulation
+      # off the PCM alone made those frames claim an active ACC with a *positive* torque
+      # request while the car was still decelerating, and the ESP (UC_FREIN) latched
+      # ACC_ETAT_DECEL_OR_ESP_STATUS = 3 (accFaulted) within 30 ms of the inversion.
+      # Measured with the driver braking over a -1.25 m/s² command. Both signals have to
+      # come off the same clock.
+      long_enabled = CS.out.cruiseState.enabled and CC.longActive
+
       # stand in for the radar for exactly as long as it is off the bus
       if self.radar_disabled and not self.radar_released and self.frame % 2 == 0:
-        can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, CS.out.cruiseState.enabled,
+        can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, long_enabled,
                                                       CS.out.gasPressed, braking, CS.out.brakePressed, CS.out.standstill, torque))
         can_sends.append(create_HS2_DYN_MDD_ETAT_2F6(self.packer, braking, CC.hudControl.leadVisible, self.bars))
 

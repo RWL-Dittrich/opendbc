@@ -1,5 +1,6 @@
 import unittest
 
+from opendbc.can import CANParser
 from opendbc.car import DT_CTRL, structs
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.psa.carcontroller import RADAR_DISABLE_FRAME, RADAR_ENABLE_TIMEOUT_FRAMES
@@ -8,6 +9,7 @@ from opendbc.car.psa.carstate import RADAR_TIMEOUT_FRAMES
 DISABLE_RADAR = (0x6B6, b'\x02\x10\x02\x80\x00\x00\x00\x00')
 ENABLE_RADAR = (0x6B6, b'\x02\x10\x01\x80\x00\x00\x00\x00')
 RADAR_EMULATION = (0x2B6, 0x2F6)
+PSA_ADAS_BUS = 1
 
 
 def make_car_interface(alpha_long: bool):
@@ -89,12 +91,12 @@ class TestPsaRadarHandoverBudget(unittest.TestCase):
 
   TestPsaRadarKnockout injects radar_alive directly, so it says nothing about how long
   that flag takes to turn over. That latency is the gap: the emulation does not start
-  until CarState has counted RADAR_TIMEOUT_FRAMES of missing 0x2B6. Route
-  00000031--72ac22ec75 spent the whole ESP budget there and faulted the car.
+  until CarState has counted RADAR_TIMEOUT_FRAMES of missing 0x2B6. A drive that spent
+  the whole ESP budget there faulted the car.
   """
 
   # UC_FREIN marks its ACC fields invalid this long after the last 0x2B6. Measured
-  # three ways in the 2026-08-15 logs: 150 ms, 160 ms, and a 152 ms fault on 00000031.
+  # three ways in the 2026-08-15 logs: 150 ms, 160 ms, and a 152 ms fault.
   ESP_TOLERANCE = 0.150
   # worst 0x2B6 inter-frame gap over 4932 steady-state frames across 4 routes; the
   # median is 20.2 ms, so anything below this reads a live radar as a dead one
@@ -130,8 +132,8 @@ class TestPsaRadarRelease(unittest.TestCase):
 
   This runs inside the control loop, on purpose: pandad puts the panda in NO_OUTPUT the
   moment deviceState goes offroad, so anything sent from the shutdown path is rejected and
-  the radar only comes back on its own S3 timeout, ~5 s later. Measured on route
-  00000033--34ce9c2130: 4.42 s of silence and the ESP latched for the whole next route.
+  the radar only comes back on its own S3 timeout, ~5 s later. Measured at 4.42 s of
+  silence, with the ESP latched for the whole of the next drive.
   """
 
   def setUp(self):
@@ -226,6 +228,80 @@ class TestPsaRadarRelease(unittest.TestCase):
     self.assertTrue(self.CI.release_ecus())
     for _ in range(RADAR_DISABLE_FRAME * 2):
       self.assertNotIn(0x6B6, self.addrs(self.step(radar_alive=True)))
+
+
+class TestPsaBrakeOverride(unittest.TestCase):
+  """The emulated radar must never invert its request when the driver takes over.
+
+  The PCM holds cruiseState.enabled up for ~80 ms after a driver brake press, but
+  controlsd zeroes actuators.accel as soon as longActive drops. Driving the emulation
+  off the PCM alone made those frames advertise an active ACC asking for *positive*
+  wheel torque while the car was still decelerating, and the ESP (UC_FREIN) latched
+  ACC_ETAT_DECEL_OR_ESP_STATUS = 3 within 30 ms.
+  """
+
+  def setUp(self):
+    self.CI = make_car_interface(alpha_long=True)
+    self.CC_SP = structs.CarControlSP()
+    self.now_nanos = 0
+    self.parser = CANParser('psa_aee2010_r3', [('HS2_DYN1_MDD_ETAT_2B6', 0)], PSA_ADAS_BUS)
+
+  def step(self, long_active: bool, accel: float, brake_pressed: bool = False, cruise_enabled: bool = True):
+    CC = structs.CarControl()
+    CC.longActive = long_active
+    CC.actuators.accel = accel
+
+    self.CI.update([])
+    self.CI.CS.radar_alive = False
+    self.CI.CS.out.cruiseState.enabled = cruise_enabled
+    self.CI.CS.out.brakePressed = brake_pressed
+    _, can_sends = self.CI.apply(CC.as_reader(), self.CC_SP, self.now_nanos)
+    self.now_nanos += int(DT_CTRL * 1e9)
+    return can_sends
+
+  def radar_msg(self, can_sends):
+    """Decode the emulated 0x2B6 out of a frame's sends, or None if it did not go out."""
+    frames = [(m[0], m[1], m[2]) for m in can_sends if m[0] == 0x2B6]
+    if not frames:
+      return None
+    self.parser.update([[self.now_nanos, frames]])
+    return self.parser.vl['HS2_DYN1_MDD_ETAT_2B6']
+
+  def knock_out(self):
+    for _ in range(RADAR_DISABLE_FRAME + 1):
+      self.CI.update([])
+      self.CI.CS.radar_alive = True
+      self.CI.apply(structs.CarControl().as_reader(), self.CC_SP, self.now_nanos)
+      self.now_nanos += int(DT_CTRL * 1e9)
+    for _ in range(10):
+      self.step(long_active=True, accel=0.0)
+    assert self.CI.CC.radar_disabled
+
+  def emulated(self, **kwargs):
+    """Run frames until the 50 Hz emulation actually emits, and return the decoded message."""
+    for _ in range(4):
+      msg = self.radar_msg(self.step(**kwargs))
+      if msg is not None:
+        return msg
+    self.fail("emulation never transmitted 0x2B6")
+
+  def test_braking_frame_requests_deceleration(self):
+    self.knock_out()
+    msg = self.emulated(long_active=True, accel=-1.25)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
+    self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -1.25, places=1)
+    self.assertEqual(int(msg['POTENTIAL_WHEEL_TORQUE_REQUEST']), 2, "not in brake mode")
+
+  def test_driver_brake_never_inverts_into_a_torque_request(self):
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.25)
+
+    # driver brakes: longActive drops and accel is zeroed, but the PCM has not caught up yet
+    msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
+    self.assertEqual(int(msg['POTENTIAL_WHEEL_TORQUE_REQUEST']), 0,
+                     "asked the ESP for wheel torque while the driver was braking")
+    self.assertEqual(msg['GMP_WHEEL_TORQUE'], -4000, "sent a torque value instead of the no-request sentinel")
+    self.assertEqual(msg['GMP_POTENTIAL_WHEEL_TORQUE'], -4000)
 
 
 if __name__ == "__main__":
