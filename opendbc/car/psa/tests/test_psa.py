@@ -246,7 +246,7 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.now_nanos = 0
     self.parser = CANParser('psa_aee2010_r3', [('HS2_DYN1_MDD_ETAT_2B6', 0)], PSA_ADAS_BUS)
 
-  def step(self, long_active: bool, accel: float, brake_pressed: bool = False, cruise_enabled: bool = True):
+  def step(self, long_active: bool, accel: float, brake_pressed: bool = False, gas_pressed: bool = False, cruise_enabled: bool = True):
     CC = structs.CarControl()
     CC.longActive = long_active
     CC.actuators.accel = accel
@@ -255,6 +255,7 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.CI.CS.radar_alive = False
     self.CI.CS.out.cruiseState.enabled = cruise_enabled
     self.CI.CS.out.brakePressed = brake_pressed
+    self.CI.CS.out.gasPressed = gas_pressed
     _, can_sends = self.CI.apply(CC.as_reader(), self.CC_SP, self.now_nanos)
     self.now_nanos += int(DT_CTRL * 1e9)
     return can_sends
@@ -298,10 +299,54 @@ class TestPsaBrakeOverride(unittest.TestCase):
 
     # driver brakes: longActive drops and accel is zeroed, but the PCM has not caught up yet
     msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
-    self.assertEqual(int(msg['POTENTIAL_WHEEL_TORQUE_REQUEST']), 0,
-                     "asked the ESP for wheel torque while the driver was braking")
+    self.assertNotEqual(int(msg['POTENTIAL_WHEEL_TORQUE_REQUEST']), 1,
+                        "asked the ESP for wheel torque while the driver was braking")
     self.assertEqual(msg['GMP_WHEEL_TORQUE'], -4000, "sent a torque value instead of the no-request sentinel")
     self.assertEqual(msg['GMP_POTENTIAL_WHEEL_TORQUE'], -4000)
+
+  def test_active_decel_is_ramped_out_not_stepped(self):
+    # releasing a -1.6 m/s² request in one frame latched the ESP fault; the release has
+    # to walk the request up before the disengaged idle value goes out
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.6)
+
+    msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1, "dropped the deceleration request in a single frame")
+    self.assertLess(msg['MDD_DESIRED_DECELERATION'], -0.5)
+    self.assertGreater(msg['MDD_DESIRED_DECELERATION'], -1.6, "release never started")
+
+    # and it settles at the idle value once the ramp is done (5 m/s²/s from -1.6)
+    for _ in range(30):
+      msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=False)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0)
+    self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], 2.05, places=1)
+
+  def test_reengage_during_release_snaps_back_down(self):
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.6)
+    self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
+
+    msg = self.emulated(long_active=True, accel=-1.6)
+    self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -1.6, places=1, msg="a deeper request must not wait on the ramp")
+
+  def test_gas_override_suspends_acc_instead_of_turning_it_off(self):
+    # a gas press drops longActive but cruise stays on; the stock radar advertises ACC
+    # suspended (ACC_STATUS 5), not the off pattern, so the cluster must not flap
+    self.knock_out()
+    self.emulated(long_active=True, accel=0.5)
+
+    msg = self.emulated(long_active=False, accel=0.0, gas_pressed=True, cruise_enabled=True)
+    self.assertEqual(int(msg['ACC_STATUS']), 5, "advertised ACC off during a gas override")
+
+  def test_gas_and_brake_together_never_request_torque(self):
+    # both pedals: the brake wins, the gas override must not keep the enabled pattern up
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.25)
+
+    msg = self.emulated(long_active=False, accel=0.0, gas_pressed=True, brake_pressed=True, cruise_enabled=True)
+    self.assertNotEqual(int(msg['POTENTIAL_WHEEL_TORQUE_REQUEST']), 1)
+    self.assertEqual(msg['GMP_WHEEL_TORQUE'], -4000)
+    self.assertNotEqual(int(msg['ACC_STATUS']), 5, "kept ACC suspended while the driver was braking")
 
 
 if __name__ == "__main__":
