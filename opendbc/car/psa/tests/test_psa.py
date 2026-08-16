@@ -1,12 +1,9 @@
 import unittest
-from unittest import mock
 
 from opendbc.car import DT_CTRL, structs
-from opendbc.car.can_definitions import CanData
 from opendbc.car.car_helpers import interfaces
-from opendbc.car.psa.carcontroller import RADAR_DISABLE_FRAME
+from opendbc.car.psa.carcontroller import RADAR_DISABLE_FRAME, RADAR_ENABLE_TIMEOUT_FRAMES
 from opendbc.car.psa.carstate import RADAR_TIMEOUT_FRAMES
-from opendbc.car.psa.interface import RADAR_ENABLE_TIMEOUT_FRAMES
 
 DISABLE_RADAR = (0x6B6, b'\x02\x10\x02\x80\x00\x00\x00\x00')
 ENABLE_RADAR = (0x6B6, b'\x02\x10\x01\x80\x00\x00\x00\x00')
@@ -128,85 +125,107 @@ class TestPsaRadarHandoverBudget(unittest.TestCase):
                        "would call the radar dead on normal 0x2B6 jitter")
 
 
-class FakeBus:
-  """Stands in for card's can_recv/can_send callbacks."""
+class TestPsaRadarRelease(unittest.TestCase):
+  """Switching alpha long off has to close the gap between us leaving 0x2B6 and the radar returning.
 
-  def __init__(self, radar_returns_after=None, radar_src=1, seed=None):
-    self.sent: list = []
-    self.calls = 0
-    self.radar_returns_after = radar_returns_after
-    self.radar_src = radar_src
-    self.seed = seed
-
-  def can_recv(self, wait_for_one=False):
-    self.calls += 1
-    if self.calls == 1:  # the counter-seeding read
-      return [list(self.seed)] if self.seed else []
-    if self.radar_returns_after is not None and self.calls > self.radar_returns_after:
-      return [[CanData(0x2B6, b'\x00' * 8, self.radar_src)]]
-    return []
-
-  def can_send(self, msgs):
-    self.sent.extend(msgs)
-
-  def addrs(self):
-    return [m[0] for m in self.sent]
-
-
-class TestPsaDeinit(unittest.TestCase):
-  """deinit() has to close the gap between openpilot leaving the bus and the radar returning."""
+  This runs inside the control loop, on purpose: pandad puts the panda in NO_OUTPUT the
+  moment deviceState goes offroad, so anything sent from the shutdown path is rejected and
+  the radar only comes back on its own S3 timeout, ~5 s later. Measured on route
+  00000033--34ce9c2130: 4.42 s of silence and the ESP latched for the whole next route.
+  """
 
   def setUp(self):
-    patcher = mock.patch('opendbc.car.psa.interface.time.sleep')
-    patcher.start()
-    self.addCleanup(patcher.stop)
+    self.CI = make_car_interface(alpha_long=True)
+    self.CC = structs.CarControl().as_reader()
+    self.CC_SP = structs.CarControlSP()
+    self.now_nanos = 0
 
-  def test_noop_without_openpilot_longitudinal(self):
-    CI = make_car_interface(alpha_long=False)
-    bus = FakeBus(radar_returns_after=1)
-    CI.deinit(CI.CP, bus.can_recv, bus.can_send)
-    self.assertEqual(bus.sent, [], "touched the radar without openpilot longitudinal")
+  def step(self, radar_alive: bool):
+    self.CI.update([])
+    self.CI.CS.radar_alive = radar_alive
+    _, can_sends = self.CI.apply(self.CC, self.CC_SP, self.now_nanos)
+    self.now_nanos += int(DT_CTRL * 1e9)
+    return can_sends
+
+  def knock_out(self):
+    """Run up to a steady state with the radar off the bus and openpilot emulating it."""
+    for _ in range(RADAR_DISABLE_FRAME + 1):
+      self.step(radar_alive=True)
+    for _ in range(10):
+      self.step(radar_alive=False)
+    assert self.CI.CC.radar_disabled
+
+  @staticmethod
+  def addrs(can_sends):
+    return [msg[0] for msg in can_sends]
 
   def test_asks_the_radar_back_and_covers_the_gap(self):
-    CI = make_car_interface(alpha_long=True)
-    bus = FakeBus(radar_returns_after=10)
-    CI.deinit(CI.CP, bus.can_recv, bus.can_send)
+    self.knock_out()
 
-    # the very first thing on the bus is the request to come back
-    self.assertEqual((bus.sent[0][0], bus.sent[0][1]), ENABLE_RADAR)
-    # and we keep emulating until it does
-    for addr in RADAR_EMULATION:
-      assert addr in bus.addrs(), "left the bus silent while the radar restarted"
+    self.assertFalse(self.CI.release_ecus(), "claimed to be done before touching the radar")
+    sent = [(m[0], m[1]) for m in self.step(radar_alive=False)]
+    self.assertIn(ENABLE_RADAR, sent, "did not ask the radar back")
 
-  def test_stops_as_soon_as_the_real_radar_transmits(self):
-    CI = make_car_interface(alpha_long=True)
-    bus = FakeBus(radar_returns_after=5)
-    CI.deinit(CI.CP, bus.can_recv, bus.can_send)
-    # two ECUs on 0x2B6 would collide, so we must get out of the way promptly
-    self.assertLess(bus.calls, RADAR_ENABLE_TIMEOUT_FRAMES)
-    self.assertLessEqual(bus.addrs().count(0x2B6), 4)
+    # keep standing in for it until it is transmitting again, and only ask once
+    seen: set[int] = set()
+    for _ in range(50):
+      msgs = self.step(radar_alive=False)
+      self.assertNotIn(ENABLE_RADAR, [(m[0], m[1]) for m in msgs])
+      seen.update(self.addrs(msgs))
+      self.assertFalse(self.CI.release_ecus())
+    self.assertTrue(RADAR_EMULATION[0] in seen and RADAR_EMULATION[1] in seen, "left the bus silent while the radar restarted")
 
-  def test_our_own_tx_echo_is_not_mistaken_for_the_radar(self):
-    CI = make_car_interface(alpha_long=True)
-    # src 129 is bus 1 with the panda's "returned" flag, i.e. our own emulated frame
-    bus = FakeBus(radar_returns_after=1, radar_src=129)
-    CI.deinit(CI.CP, bus.can_recv, bus.can_send)
-    self.assertGreater(bus.addrs().count(0x2B6), 10, "quit on its own echo")
+  def test_stops_emulating_as_soon_as_the_real_radar_transmits(self):
+    self.knock_out()
+    self.CI.release_ecus()
+    for _ in range(10):
+      self.step(radar_alive=False)
+
+    # two ECUs on 0x2B6 would collide, so get out of the way on the first live frame
+    self.step(radar_alive=True)
+    self.assertTrue(self.CI.release_ecus(), "did not notice the radar came back")
+    for _ in range(20):
+      addrs = self.addrs(self.step(radar_alive=True))
+      self.assertNotIn(0x6B6, addrs)
+      for addr in RADAR_EMULATION:
+        self.assertNotIn(addr, addrs, "still emulating after the radar returned")
+
+  def test_tester_present_stops_so_the_session_can_end(self):
+    self.knock_out()
+    self.CI.release_ecus()
+    for _ in range(300):
+      self.assertNotIn(0x6B6, self.addrs(self.step(radar_alive=False))[1:], "kept the radar in its programming session")
 
   def test_terminates_if_the_radar_never_comes_back(self):
-    CI = make_car_interface(alpha_long=True)
-    bus = FakeBus(radar_returns_after=None)
-    CI.deinit(CI.CP, bus.can_recv, bus.can_send)
-    self.assertEqual(bus.calls, RADAR_ENABLE_TIMEOUT_FRAMES + 1)
+    self.knock_out()
+    self.CI.release_ecus()
+    for _ in range(RADAR_ENABLE_TIMEOUT_FRAMES - 1):
+      self.step(radar_alive=False)
+    self.assertFalse(self.CI.release_ecus())
+    self.step(radar_alive=False)
+    self.assertTrue(self.CI.release_ecus(), "would hold the onroad cycle forever")
 
-  def test_continues_the_counter_sequence(self):
-    CI = make_car_interface(alpha_long=True)
-    # last 0x2B6 on the bus carried COUNTER 7 (high nibble of byte 7)
-    bus = FakeBus(radar_returns_after=None, seed=[CanData(0x2B6, b'\x00' * 7 + b'\x70', 129)])
-    CI.deinit(CI.CP, bus.can_recv, bus.can_send)
+  def test_nothing_to_hand_back_before_the_knockout(self):
+    # toggled off inside the RADAR_DISABLE_FRAME window, we never touched the radar
+    self.step(radar_alive=True)
+    self.CI.release_ecus()
+    sent = [(m[0], m[1]) for m in self.step(radar_alive=True)]
+    self.assertTrue(self.CI.release_ecus())
+    self.assertNotIn(ENABLE_RADAR, sent)
 
-    counters = [m[1][7] >> 4 for m in bus.sent if m[0] == 0x2B6]
-    self.assertEqual(counters[:3], [8, 9, 10], "restarted the counter instead of continuing it")
+  def test_knockout_never_fires_after_a_release(self):
+    self.knock_out()
+    self.CI.release_ecus()
+    self.step(radar_alive=True)
+    for _ in range(RADAR_DISABLE_FRAME * 2):
+      sent = [(m[0], m[1]) for m in self.step(radar_alive=True)]
+      self.assertNotIn(DISABLE_RADAR, sent, "knocked the radar out again after handing it back")
+
+  def test_release_is_a_noop_without_openpilot_longitudinal(self):
+    self.CI = make_car_interface(alpha_long=False)
+    self.assertTrue(self.CI.release_ecus())
+    for _ in range(RADAR_DISABLE_FRAME * 2):
+      self.assertNotIn(0x6B6, self.addrs(self.step(radar_alive=True)))
 
 
 if __name__ == "__main__":
