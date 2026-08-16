@@ -10,9 +10,16 @@ TransmissionType = structs.CarParams.TransmissionType
 
 # Radar ECU (ARTIV) message used to tell whether the stock radar is still on the bus.
 RADAR_MSG = 'HS2_DYN1_MDD_ETAT_2B6'
-# 0x2B6 is 50 Hz and update() runs at 100 Hz. The ESP (UC_FREIN) marks its ACC
-# fields invalid after ~150 ms without it, so notice comfortably before that.
-RADAR_TIMEOUT_FRAMES = 15
+# 0x2B6 is 50 Hz and update() runs at 100 Hz, so this counts 10 ms per frame and the
+# whole of it lands inside the ADAS bus silence the knockout opens up: the emulation
+# only starts once this has expired. The ESP (UC_FREIN) marks its ACC fields invalid
+# after ~150 ms without 0x2B6, so this has to be a fraction of that budget, not all
+# of it. 15 frames (150 ms) spent the budget exactly and faulted the car on route
+# 00000031--72ac22ec75 — the ESP flagged 152 ms after the radar's last frame, 21 ms
+# before the emulation's first. Bound below by the message's own jitter: 20.2 ms
+# median, 35.4 ms worst over 4932 frames across 4 routes. 6 frames is 1.7x that worst
+# gap, and holds the total silence to ~70 ms.
+RADAR_TIMEOUT_FRAMES = 6
 
 
 class CarState(CarStateBase):

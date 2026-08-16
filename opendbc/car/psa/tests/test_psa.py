@@ -5,6 +5,7 @@ from opendbc.car import DT_CTRL, structs
 from opendbc.car.can_definitions import CanData
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.psa.carcontroller import RADAR_DISABLE_FRAME
+from opendbc.car.psa.carstate import RADAR_TIMEOUT_FRAMES
 from opendbc.car.psa.interface import RADAR_ENABLE_TIMEOUT_FRAMES
 
 DISABLE_RADAR = (0x6B6, b'\x02\x10\x02\x80\x00\x00\x00\x00')
@@ -84,6 +85,47 @@ class TestPsaRadarKnockout(unittest.TestCase):
       self.assertNotIn(0x6B6, addrs)
       for addr in RADAR_EMULATION:
         self.assertNotIn(addr, addrs)
+
+
+class TestPsaRadarHandoverBudget(unittest.TestCase):
+  """The knockout hands 0x2B6 from the radar to openpilot, and the gap is on a clock.
+
+  TestPsaRadarKnockout injects radar_alive directly, so it says nothing about how long
+  that flag takes to turn over. That latency is the gap: the emulation does not start
+  until CarState has counted RADAR_TIMEOUT_FRAMES of missing 0x2B6. Route
+  00000031--72ac22ec75 spent the whole ESP budget there and faulted the car.
+  """
+
+  # UC_FREIN marks its ACC fields invalid this long after the last 0x2B6. Measured
+  # three ways in the 2026-08-15 logs: 150 ms, 160 ms, and a 152 ms fault on 00000031.
+  ESP_TOLERANCE = 0.150
+  # worst 0x2B6 inter-frame gap over 4932 steady-state frames across 4 routes; the
+  # median is 20.2 ms, so anything below this reads a live radar as a dead one
+  WORST_RADAR_JITTER = 0.0354
+
+  def silence(self):
+    """Longest ADAS bus silence the knockout can open up, worst case."""
+    # the radar's last frame can land a full period before the knockout goes out
+    radar_period = 0.020
+    # CarState needs this many 10 ms frames of no 0x2B6 to call the radar dead
+    detection = RADAR_TIMEOUT_FRAMES * DT_CTRL
+    # and the emulation is gated to even frames, so it can wait one more
+    return radar_period + detection + DT_CTRL
+
+  def test_emulation_starts_before_the_esp_gives_up(self):
+    self.assertLess(self.silence(), self.ESP_TOLERANCE,
+                    "0x2B6 goes missing for longer than the ESP tolerates; the car faults with accFaulted as alpha long engages")
+
+  def test_emulation_starts_with_margin(self):
+    # 150 ms is where it faulted, not where it is safe. The jitter floor below puts a
+    # hard lower bound on the detection half of the budget, so 1.5x is what is on offer.
+    self.assertLess(self.silence() * 1.5, self.ESP_TOLERANCE,
+                    "no useful margin on the ESP's 150 ms tolerance")
+
+  def test_detection_is_slower_than_the_radar_jitter(self):
+    # too short and a live radar reads as dead, putting two ECUs on 0x2B6 at once
+    self.assertGreater(RADAR_TIMEOUT_FRAMES * DT_CTRL, self.WORST_RADAR_JITTER * 1.5,
+                       "would call the radar dead on normal 0x2B6 jitter")
 
 
 class FakeBus:
