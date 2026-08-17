@@ -245,8 +245,10 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.CC_SP = structs.CarControlSP()
     self.now_nanos = 0
     self.parser = CANParser('psa_aee2010_r3', [('HS2_DYN1_MDD_ETAT_2B6', 0)], PSA_ADAS_BUS)
+    self.parser_2f6 = CANParser('psa_aee2010_r3', [('HS2_DYN_MDD_ETAT_2F6', 0)], PSA_ADAS_BUS)
 
-  def step(self, long_active: bool, accel: float, brake_pressed: bool = False, gas_pressed: bool = False, cruise_enabled: bool = True):
+  def step(self, long_active: bool, accel: float, brake_pressed: bool = False, gas_pressed: bool = False, cruise_enabled: bool = True,
+           standstill: bool = False, v_ego: float = 0.0):
     CC = structs.CarControl()
     CC.longActive = long_active
     CC.actuators.accel = accel
@@ -256,6 +258,8 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.CI.CS.out.cruiseState.enabled = cruise_enabled
     self.CI.CS.out.brakePressed = brake_pressed
     self.CI.CS.out.gasPressed = gas_pressed
+    self.CI.CS.out.standstill = standstill
+    self.CI.CS.out.vEgo = v_ego
     _, can_sends = self.CI.apply(CC.as_reader(), self.CC_SP, self.now_nanos)
     self.now_nanos += int(DT_CTRL * 1e9)
     return can_sends
@@ -284,6 +288,17 @@ class TestPsaBrakeOverride(unittest.TestCase):
       msg = self.radar_msg(self.step(**kwargs))
       if msg is not None:
         return msg
+    self.fail("emulation never transmitted 0x2B6")
+
+  def emulated_pair(self, **kwargs):
+    """Like emulated(), but returns the decoded (0x2B6, 0x2F6) pair from the same frame."""
+    for _ in range(4):
+      sends = self.step(**kwargs)
+      b6 = self.radar_msg(sends)
+      if b6 is not None:
+        f6 = [(m[0], m[1], m[2]) for m in sends if m[0] == 0x2F6]
+        self.parser_2f6.update([[self.now_nanos, f6]])
+        return b6, self.parser_2f6.vl['HS2_DYN_MDD_ETAT_2F6']
     self.fail("emulation never transmitted 0x2B6")
 
   def test_braking_frame_requests_deceleration(self):
@@ -335,6 +350,41 @@ class TestPsaBrakeOverride(unittest.TestCase):
     msg = self.emulated(long_active=True, accel=-1.25, brake_pressed=True)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
     self.assertEqual(int(msg['ACC_STATUS']), 4, "advertised ACC off while still requesting deceleration")
+
+  def test_standstill_hold_and_drive_away(self):
+    # the ESP holds the car at a stop for the radar and only releases after the stock
+    # drive-away handshake: hold pattern (saturated -10.65 decel code, no wheel torque),
+    # DRIVE_AWAY_REQUEST pulsed in 0x2F6, then wheel torque with the decel request still
+    # active until the car is rolling
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.0, v_ego=1.0)
+
+    # stopped: hold pattern
+    msg = self.emulated(long_active=True, accel=-0.2, standstill=True)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
+    self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -10.65, places=1)
+    self.assertEqual(int(msg['WHEEL_TORQUE_REQUEST']), 0)
+    self.assertEqual(int(msg['ACC_STATUS']), 4)
+
+    # planner wants to move: the pulse goes up while 0x2B6 stays in the hold pattern
+    b6, f6 = self.emulated_pair(long_active=True, accel=0.3, standstill=True)
+    self.assertEqual(int(f6['DRIVE_AWAY_REQUEST']), 1)
+    self.assertAlmostEqual(b6['MDD_DESIRED_DECELERATION'], -10.65, places=1)
+    self.assertEqual(int(b6['WHEEL_TORQUE_REQUEST']), 0)
+
+    # pulse over: launch, wheel torque up with the decel request still active
+    for _ in range(100):
+      b6, f6 = self.emulated_pair(long_active=True, accel=0.3, standstill=True)
+    self.assertEqual(int(f6['DRIVE_AWAY_REQUEST']), 0)
+    self.assertEqual(int(b6['WHEEL_TORQUE_REQUEST']), 1)
+    self.assertGreater(b6['GMP_WHEEL_TORQUE'], 0)
+    self.assertEqual(int(b6['MDD_DECEL_CONTROL_REQ']), 1)
+    self.assertAlmostEqual(b6['MDD_DESIRED_DECELERATION'], 1.0, places=1)
+
+    # rolling: back to the plain torque pattern
+    b6, f6 = self.emulated_pair(long_active=True, accel=0.3, v_ego=1.0)
+    self.assertEqual(int(b6['MDD_DECEL_CONTROL_REQ']), 0)
+    self.assertEqual(int(b6['WHEEL_TORQUE_REQUEST']), 1)
 
   def test_gas_override_suspends_acc_instead_of_turning_it_off(self):
     # a gas press drops longActive but cruise stays on; the stock radar advertises ACC

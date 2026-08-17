@@ -26,6 +26,13 @@ RADAR_DISABLE_FRAME = 100  # 1.0 s
 # 0x2B6 reappears, so this only bounds the case where it never does.
 RADAR_ENABLE_TIMEOUT_FRAMES = 200  # 2.0 s
 
+# The ESP holds the car at a standstill for the radar (autohold-style) and only lets go
+# after a drive-away handshake: DRIVE_AWAY_REQUEST pulsed in 0x2F6 (~0.8 s measured on the
+# stock radar) while 0x2B6 stays in the hold pattern, then wheel torque with the decel
+# request still active until the car is rolling — see create_HS2_DYN1_MDD_ETAT_2B6.
+DRIVE_AWAY_FRAMES = 80   # 0.8 s at 100 Hz
+LAUNCH_COMPLETE_SPEED = 0.5  # m/s, decel request released above this
+
 # CMM (the engine ECU) takes a wheel-torque request, not an acceleration, so this map is
 # the conversion the stock radar would have done. Calibrated against measured accel from
 # the LongitudinalManeuverMode suite — see helper-scripts/accel_map.py, which imports
@@ -58,6 +65,9 @@ class CarController(CarControllerBase):
     self.radar_release_frame = 0
     self.status = 2
     self.bars = 4
+    self.hold = False
+    self.launching = False
+    self.drive_away_frames = 0
 
     # Vehicle model used for lateral limiting
     self.VM = VehicleModel(get_safety_CP())
@@ -191,11 +201,37 @@ class CarController(CarControllerBase):
 
       decel_active = braking and long_enabled
 
+      # standstill hold / drive-away, mirroring the stock radar sequence (see DRIVE_AWAY_FRAMES)
+      if not long_enabled:
+        self.hold = False
+        self.launching = False
+        self.drive_away_frames = 0
+      elif self.hold:
+        if accel_cmd > 0.0:
+          self.hold = False
+          self.drive_away_frames = DRIVE_AWAY_FRAMES
+      elif self.drive_away_frames > 0:
+        self.drive_away_frames -= 1
+        if self.drive_away_frames == 0:
+          self.launching = True
+      elif self.launching:
+        if CS.out.vEgo >= LAUNCH_COMPLETE_SPEED:
+          self.launching = False
+        elif CS.out.standstill and accel_cmd <= 0.0:  # lead stopped again before we got rolling
+          self.launching = False
+          self.hold = True
+      elif CS.out.standstill and accel_cmd <= 0.0:
+        self.hold = True
+      drive_away = self.drive_away_frames > 0
+      standstill_hold = self.hold or drive_away
+
       # stand in for the radar for exactly as long as it is off the bus
       if self.radar_disabled and not self.radar_released and self.frame % 2 == 0:
         can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, decel_active, long_enabled,
-                                                      CS.out.gasPressed, CS.out.brakePressed, CS.out.standstill, torque))
-        can_sends.append(create_HS2_DYN_MDD_ETAT_2F6(self.packer, decel_active, CC.hudControl.leadVisible, self.bars))
+                                                      CS.out.gasPressed, CS.out.brakePressed, CS.out.standstill, torque,
+                                                      standstill_hold, self.launching))
+        can_sends.append(create_HS2_DYN_MDD_ETAT_2F6(self.packer, decel_active or standstill_hold or self.launching,
+                                                     CC.hudControl.leadVisible, self.bars, drive_away))
 
     # stock long
     # emulate resume button every 3 seconds to prevent autohold timeout
