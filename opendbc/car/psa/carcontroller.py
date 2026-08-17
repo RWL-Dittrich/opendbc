@@ -30,20 +30,12 @@ RADAR_ENABLE_TIMEOUT_FRAMES = 200  # 2.0 s
 # the conversion the stock radar would have done. Calibrated against measured accel from
 # the LongitudinalManeuverMode suite — see helper-scripts/accel_map.py, which imports
 # these directly so its suggestions can never be against a stale copy.
+# The -0.5 and 0.0 points were recalibrated from the ki integrator's steady-state offset
+# during engaged regen braking (~170 N.m over-braking across the -0.5..0 region): holding
+# 0 m/s² took ~170 N.m and delivering -0.5 m/s² took ~-130 N.m. Single-route evidence —
+# re-check with accel_map.py after the next drive.
 ACCEL_LOOKUP = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]     # m/s²
-TORQUE_LOOKUP = [-400, -300, 120, 350, 645, 862, 1100]   # N.m
-
-# The ESP (UC_FREIN) latches ACC_ETAT_DECEL_OR_ESP_STATUS = 3 (accFaulted, and the fault
-# survives ignition cycles) when an active deceleration request is released in a single
-# frame: measured with a -1.6 m/s² request stepping to the idle value on a driver brake
-# press, the ESP went 2 -> 0 -> 3 within 40 ms. Steps from the -0.5 brake-mode boundary
-# happen on every normal brake-to-torque transition and never fault, so the release is
-# ramped only while the request is below that boundary. The whole 0x2B6 frame has to
-# stay in the active-decel pattern for the ramp's duration, ACC_STATUS included — see
-# create_HS2_DYN1_MDD_ETAT_2B6; the stock radar releases from shallow decel by holding
-# the full active pattern briefly and then dropping every signal in one frame.
-DECEL_INACTIVE = 2.05        # m/s², idle value of MDD_DESIRED_DECELERATION
-DECEL_RELEASE_RATE = 0.05    # m/s² per 100 Hz frame, 5 m/s²/s
+TORQUE_LOOKUP = [-400, -130, 170, 350, 645, 862, 1100]   # N.m
 
 
 def get_safety_CP():
@@ -66,7 +58,6 @@ class CarController(CarControllerBase):
     self.radar_release_frame = 0
     self.status = 2
     self.bars = 4
-    self.desired_decel = DECEL_INACTIVE
 
     # Vehicle model used for lateral limiting
     self.VM = VehicleModel(get_safety_CP())
@@ -198,19 +189,11 @@ class CarController(CarControllerBase):
       gas_override = CS.out.gasPressed and not CS.out.brakePressed
       long_enabled = CS.out.cruiseState.enabled and (CC.longActive or gas_override)
 
-      # ramp an active deceleration request out instead of stepping it, see DECEL_RELEASE_RATE
-      decel_target = actuators.accel if (braking and long_enabled) else DECEL_INACTIVE
-      if decel_target <= self.desired_decel:
-        self.desired_decel = decel_target
-      elif self.desired_decel < brake_accel:
-        self.desired_decel = min(self.desired_decel + DECEL_RELEASE_RATE, brake_accel)
-      else:
-        self.desired_decel = decel_target
-      decel_active = self.desired_decel < DECEL_INACTIVE
+      decel_active = braking and long_enabled
 
       # stand in for the radar for exactly as long as it is off the bus
       if self.radar_disabled and not self.radar_released and self.frame % 2 == 0:
-        can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, self.desired_decel, decel_active, long_enabled,
+        can_sends.append(create_HS2_DYN1_MDD_ETAT_2B6(self.packer, self.frame // 2, actuators.accel, decel_active, long_enabled,
                                                       CS.out.gasPressed, CS.out.brakePressed, CS.out.standstill, torque))
         can_sends.append(create_HS2_DYN_MDD_ETAT_2F6(self.packer, decel_active, CC.hudControl.leadVisible, self.bars))
 

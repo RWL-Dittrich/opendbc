@@ -34,25 +34,25 @@ def create_drive_away_request(packer, hs2_dyn_mdd_etat_2f6):
 
 
 # Radar, 50 Hz
-def create_HS2_DYN1_MDD_ETAT_2B6(packer, frame: int, desired_decel: float, decel_active: bool, enabled: bool,
+def create_HS2_DYN1_MDD_ETAT_2B6(packer, frame: int, accel: float, decel_active: bool, enabled: bool,
                                  gasPressed: bool, brakePressed: bool, standstill: bool, torque: int):
-  # TODO: tune torque multiplier
   # TODO: check difference between GMP_POTENTIAL_WHEEL_TORQUE and GMP_WHEEL_TORQUE
   # TODO: transition from waiting to active enables torque control. For now, deactivate autohold or enable on brake pressed
 
-  # decel_active can outlive enabled: an active deceleration request has to be ramped
-  # out, not stepped, or the ESP latches a fault — see the release ramp in carcontroller.
-  # While it does, ACC_STATUS must keep advertising active (4): the stock radar holds the
-  # full active pattern after a driver brake press and then drops every signal in one
-  # frame; sending the off pattern (2) while the decel request was still up latched the
-  # ESP fault within 50 ms of the brake press, with the ramp itself running correctly.
+  # While a deceleration request is active, ACC_STATUS must keep advertising active (4):
+  # the stock radar holds the full active pattern after a driver brake press and then
+  # drops every signal in one frame, and sending the off pattern (2) while the decel
+  # request was still up latched the ESP fault within 50 ms. That includes the first
+  # frames of a pedal press while still enabled: the pedal flag goes true a frame before
+  # controlsd disengages, so the pedal-derived statuses (2/5) must wait for decel_active
+  # to clear — the release has to be atomic, never partial.
   torque_mode = enabled and not decel_active
   values = {
-    'MDD_DESIRED_DECELERATION': desired_decel, # m/s²
+    'MDD_DESIRED_DECELERATION': accel if decel_active else 2.05, # m/s², 2.05 is the field's idle value
     'POTENTIAL_WHEEL_TORQUE_REQUEST': 2 if decel_active else (1 if enabled else 0),
     'MIN_TIME_FOR_DESIRED_GEAR': 6.2 if torque_mode else 0.0,
     'GMP_POTENTIAL_WHEEL_TORQUE': torque if torque_mode else -4000,
-    'ACC_STATUS': (5 if gasPressed else 2 if brakePressed and not standstill else 4) if enabled else (4 if decel_active else 2 if brakePressed else 3),
+    'ACC_STATUS': 4 if decel_active else ((5 if gasPressed else 2 if brakePressed and not standstill else 4) if enabled else (2 if brakePressed else 3)),
     'GMP_WHEEL_TORQUE': torque if torque_mode else -4000,
     'WHEEL_TORQUE_REQUEST': 1 if torque_mode else 0, # TODO: test 1: high torque range 2: low torque range
     'AUTO_BRAKING_STATUS': 3, # AEB # TODO: testing ALWAYS ENABLED to resolve DTC errors if enabled else 3, # maybe disabled on too high steering angle

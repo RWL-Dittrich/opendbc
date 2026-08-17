@@ -304,48 +304,37 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.assertEqual(msg['GMP_WHEEL_TORQUE'], -4000, "sent a torque value instead of the no-request sentinel")
     self.assertEqual(msg['GMP_POTENTIAL_WHEEL_TORQUE'], -4000)
 
-  def test_active_decel_is_ramped_out_not_stepped(self):
-    # releasing a -1.6 m/s² request in one frame latched the ESP fault; the release has
-    # to walk the request up before the disengaged idle value goes out
+  def test_release_is_atomic(self):
+    # the stock radar releases an active deceleration by dropping every signal to idle in
+    # the same frame — a partial release (the off/suspended status with the decel request
+    # still up, or the request cleared with a stale desired decel) latched the ESP fault
     self.knock_out()
     self.emulated(long_active=True, accel=-1.6)
 
     msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
-    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1, "dropped the deceleration request in a single frame")
-    self.assertLess(msg['MDD_DESIRED_DECELERATION'], -0.5)
-    self.assertGreater(msg['MDD_DESIRED_DECELERATION'], -1.6, "release never started")
-
-    # and it settles at the idle value once the ramp is done (5 m/s²/s from -1.6)
-    for _ in range(30):
-      msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=False)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0)
     self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], 2.05, places=1)
+    self.assertEqual(int(msg['ACC_STATUS']), 2, "brake release must advertise ACC off with the request down")
 
-  def test_reengage_during_release_snaps_back_down(self):
-    self.knock_out()
-    self.emulated(long_active=True, accel=-1.6)
-    self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
-
-    msg = self.emulated(long_active=True, accel=-1.6)
-    self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -1.6, places=1, msg="a deeper request must not wait on the ramp")
-
-  def test_release_ramp_keeps_acc_advertised_active(self):
-    # the stock radar holds the full active pattern (ACC_STATUS 4, decel request up) after
-    # a driver brake press and then drops every signal in one frame; advertising the off
-    # pattern (2) while still requesting deceleration latched the ESP fault within 50 ms
-    # of the brake press, with the release ramp itself running correctly
+  def test_gas_release_is_atomic(self):
     self.knock_out()
     self.emulated(long_active=True, accel=-1.6)
 
-    msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
+    msg = self.emulated(long_active=True, accel=-1.6, gas_pressed=True)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0)
+    self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], 2.05, places=1)
+    self.assertEqual(int(msg['ACC_STATUS']), 5, "gas over a decel suspends ACC, with the request down")
+
+  def test_brake_press_while_still_enabled_keeps_acc_advertised_active(self):
+    # brakePressed goes true a frame before controlsd drops longActive, so the off status
+    # must wait for the decel request to clear: one frame of ACC_STATUS 2 with the decel
+    # request still up latched the ESP fault
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.25)
+
+    msg = self.emulated(long_active=True, accel=-1.25, brake_pressed=True)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
     self.assertEqual(int(msg['ACC_STATUS']), 4, "advertised ACC off while still requesting deceleration")
-
-    # once the ramp is done, everything drops together
-    for _ in range(30):
-      msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
-    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0)
-    self.assertEqual(int(msg['ACC_STATUS']), 2, "brake held after the release must advertise ACC off")
 
   def test_gas_override_suspends_acc_instead_of_turning_it_off(self):
     # a gas press drops longActive but cruise stays on; the stock radar advertises ACC
