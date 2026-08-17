@@ -21,7 +21,6 @@ RADAR_MSG = 'HS2_DYN1_MDD_ETAT_2B6'
 # gap, and holds the total silence to ~70 ms.
 RADAR_TIMEOUT_FRAMES = 6
 
-
 class CarState(CarStateBase):
   def __init__(self, CP, CP_SP):
     super().__init__(CP, CP_SP)

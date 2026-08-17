@@ -53,6 +53,7 @@ PSA_SERIAL_RESP = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER + 0x40, 0xF1, 
 PSA_RX_OFFSET = -0x20
 
 FW_QUERY_CONFIG = FwQueryConfig(
+  fw_version_regex=br"\d{9}",
   requests=[
     Request(
       [PSA_DIAG_REQ, PSA_SERIAL_REQ],
