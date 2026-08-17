@@ -40,11 +40,9 @@ class CarInterface(CarInterfaceBase):
     ret.alphaLongitudinalAvailable = True
     ret.openpilotLongitudinalControl = alpha_long
 
-    # the accel->torque map in carcontroller is pure feedforward and speed-blind, so any
-    # unmodeled load (aero drag above ~15 m/s, grade residual, headwind) becomes a
-    # permanent steady-state error: measured -0.15 m/s² at 80 km/h on flat ground, the
-    # car sagging 2-3 km/h under the set speed with no lead. The integrator trims that
-    # out. ki only — kp would fight the map's slope errors frame-by-frame.
+    # long tuning
+    ret.longitudinalActuatorDelay = 0.25
+
     ret.longitudinalTuning.kiBP = [0.]
     ret.longitudinalTuning.kiV = [0.5]
 
