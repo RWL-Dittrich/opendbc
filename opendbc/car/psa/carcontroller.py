@@ -31,14 +31,17 @@ RADAR_ENABLE_TIMEOUT_FRAMES = 200  # 2.0 s
 # the LongitudinalManeuverMode suite — see helper-scripts/accel_map.py, which imports
 # these directly so its suggestions can never be against a stale copy.
 ACCEL_LOOKUP = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]     # m/s²
-TORQUE_LOOKUP = [-400, -300, 120, 350, 645, 862, 1000]   # N.m
+TORQUE_LOOKUP = [-400, -300, 120, 350, 645, 862, 1100]   # N.m
 
 # The ESP (UC_FREIN) latches ACC_ETAT_DECEL_OR_ESP_STATUS = 3 (accFaulted, and the fault
 # survives ignition cycles) when an active deceleration request is released in a single
 # frame: measured with a -1.6 m/s² request stepping to the idle value on a driver brake
 # press, the ESP went 2 -> 0 -> 3 within 40 ms. Steps from the -0.5 brake-mode boundary
 # happen on every normal brake-to-torque transition and never fault, so the release is
-# ramped only while the request is below that boundary.
+# ramped only while the request is below that boundary. The whole 0x2B6 frame has to
+# stay in the active-decel pattern for the ramp's duration, ACC_STATUS included — see
+# create_HS2_DYN1_MDD_ETAT_2B6; the stock radar releases from shallow decel by holding
+# the full active pattern briefly and then dropping every signal in one frame.
 DECEL_INACTIVE = 2.05        # m/s², idle value of MDD_DESIRED_DECELERATION
 DECEL_RELEASE_RATE = 0.05    # m/s² per 100 Hz frame, 5 m/s²/s
 
@@ -135,8 +138,11 @@ class CarController(CarControllerBase):
     brake_accel = -0.5
 
     # calculate Torque
+    # 1100 N.m extrapolates the measured 434 N.m per m/s² slope to a true 2.0 m/s²; the
+    # stock radar's observed ceiling is 986 N.m (sustained, no gas), so whether the CMM
+    # accepts requests past ~1000 is unverified — check delivered accel with accel_map.py
     torque_nm = interp(accel_cmd, ACCEL_LOOKUP, TORQUE_LOOKUP)
-    torque = max(-400, min(torque_nm, 1000))
+    torque = max(-400, min(torque_nm, 1100))
 
     braking = accel_cmd < brake_accel and not CS.out.gasPressed
     if self.CP.openpilotLongitudinalControl:

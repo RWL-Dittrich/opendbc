@@ -329,6 +329,24 @@ class TestPsaBrakeOverride(unittest.TestCase):
     msg = self.emulated(long_active=True, accel=-1.6)
     self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -1.6, places=1, msg="a deeper request must not wait on the ramp")
 
+  def test_release_ramp_keeps_acc_advertised_active(self):
+    # the stock radar holds the full active pattern (ACC_STATUS 4, decel request up) after
+    # a driver brake press and then drops every signal in one frame; advertising the off
+    # pattern (2) while still requesting deceleration latched the ESP fault within 50 ms
+    # of the brake press, with the release ramp itself running correctly
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.6)
+
+    msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
+    self.assertEqual(int(msg['ACC_STATUS']), 4, "advertised ACC off while still requesting deceleration")
+
+    # once the ramp is done, everything drops together
+    for _ in range(30):
+      msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0)
+    self.assertEqual(int(msg['ACC_STATUS']), 2, "brake held after the release must advertise ACC off")
+
   def test_gas_override_suspends_acc_instead_of_turning_it_off(self):
     # a gas press drops longActive but cruise stays on; the stock radar advertises ACC
     # suspended (ACC_STATUS 5), not the off pattern, so the cluster must not flap
