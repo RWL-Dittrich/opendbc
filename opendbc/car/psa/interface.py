@@ -37,6 +37,13 @@ class CarInterface(CarInterfaceBase):
     ret.steerControlType = structs.CarParams.SteerControlType.angle
     ret.radarUnavailable = True
 
+    # Wheel speeds read low: over a drive above 8 m/s, GPS speed (speedAccuracy < 1 m/s) was a
+    # median 1.1% higher at 17-22 m/s and 1.3% higher above 27 m/s. Left at 1.0 the resulting
+    # vEgo also disagrees with the model's own speed estimate, which radard subtracts from the
+    # vision lead's speed, so the lead reads ~0.4 m/s slower than it is and the MPC holds a
+    # target gap several metres too large.
+    ret.wheelSpeedFactor = 1.01
+
     ret.alphaLongitudinalAvailable = True
     ret.openpilotLongitudinalControl = alpha_long
 
