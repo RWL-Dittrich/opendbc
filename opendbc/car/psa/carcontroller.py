@@ -26,12 +26,21 @@ RADAR_DISABLE_FRAME = 100  # 1.0 s
 # 0x2B6 reappears, so this only bounds the case where it never does.
 RADAR_ENABLE_TIMEOUT_FRAMES = 200  # 2.0 s
 
-# The ESP holds the car at a standstill for the radar (autohold-style) and only lets go
-# after a drive-away handshake: DRIVE_AWAY_REQUEST pulsed in 0x2F6 (~0.8 s measured on the
-# stock radar) while 0x2B6 stays in the hold pattern, then wheel torque with the decel
-# request still active until the car is rolling — see create_HS2_DYN1_MDD_ETAT_2B6.
-DRIVE_AWAY_FRAMES = 80   # 0.8 s at 100 Hz
+# The ESP holds the car at a standstill for the radar (autohold-style) and reports it as
+# ARRET_VHL_ADAS in 0x32D, about a second after the car comes to rest. What releases that
+# hold is the launch pattern in 0x2B6, not the 0x2F6 pulse: across the stock drive-aways
+# the ESP cleared ARRET_VHL_ADAS 70-100 ms after the first launch frame, then ramped the
+# brakes out over ~0.5 s, and one stock launch carried no DRIVE_AWAY_REQUEST at all. The
+# pulse is kept because the stock radar usually sends one, but only for its measured
+# length of ~40 ms — see create_HS2_DYN1_MDD_ETAT_2B6.
+DRIVE_AWAY_FRAMES = 4   # 40 ms at 100 Hz
 LAUNCH_COMPLETE_SPEED = 0.5  # m/s, decel request released above this
+
+# Torque floor while the ESP is still holding the car. The stock radar opened its launches
+# with 458-939 N.m (six drive-aways) and advertised 700-1000 N.m of potential wheel torque
+# throughout the hold; the accel map alone asks ~320 N.m at the planner's first positive
+# command, below anything the stock radar was seen to use to get the car moving.
+LAUNCH_TORQUE = 600  # N.m
 
 # CMM (the engine ECU) takes a wheel-torque request, not an acceleration, so this map is
 # the conversion the stock radar would have done. Calibrated against measured accel from
@@ -201,13 +210,20 @@ class CarController(CarControllerBase):
 
       decel_active = braking and long_enabled
 
-      # standstill hold / drive-away, mirroring the stock radar sequence (see DRIVE_AWAY_FRAMES)
-      if not long_enabled:
+      # Standstill hold / drive-away, mirroring the stock radar sequence (see DRIVE_AWAY_FRAMES).
+      # Driven off the planner's own request rather than the pitch-compensated one: on a
+      # descent the gravity term alone keeps accel_cmd negative, and the hold would never
+      # release however hard the planner asked to move.
+      # A gas press ends the hold immediately. The stock radar drops the decel request and
+      # advertises ACC suspended when the driver takes over; holding the ESP instead put a
+      # decel request up against the driver's own torque and latched the fault
+      # (ACC_ETAT_DECEL_OR_ESP_STATUS 2 -> 0 -> 3 within ~0.5 s of the pedal).
+      if not long_enabled or CS.out.gasPressed:
         self.hold = False
         self.launching = False
         self.drive_away_frames = 0
       elif self.hold:
-        if accel_cmd > 0.0:
+        if actuators.accel > 0.0:
           self.hold = False
           self.drive_away_frames = DRIVE_AWAY_FRAMES
       elif self.drive_away_frames > 0:
@@ -217,13 +233,19 @@ class CarController(CarControllerBase):
       elif self.launching:
         if CS.out.vEgo >= LAUNCH_COMPLETE_SPEED:
           self.launching = False
-        elif CS.out.standstill and accel_cmd <= 0.0:  # lead stopped again before we got rolling
+        elif CS.out.standstill and actuators.accel <= 0.0:  # lead stopped again before we got rolling
           self.launching = False
           self.hold = True
-      elif CS.out.standstill and accel_cmd <= 0.0:
+      elif CS.out.standstill and actuators.accel <= 0.0:
         self.hold = True
       drive_away = self.drive_away_frames > 0
       standstill_hold = self.hold or drive_away
+
+      # the brakes are still on their way out through the launch, so ask for at least what
+      # the stock radar used to break the hold, and advertise it as potential torque while
+      # holding — the map's own value only takes over once it climbs past the floor
+      if standstill_hold or self.launching:
+        torque = max(torque, LAUNCH_TORQUE)
 
       # stand in for the radar for exactly as long as it is off the bus
       if self.radar_disabled and not self.radar_released and self.frame % 2 == 0:

@@ -3,7 +3,7 @@ import unittest
 from opendbc.can import CANParser
 from opendbc.car import DT_CTRL, structs
 from opendbc.car.car_helpers import interfaces
-from opendbc.car.psa.carcontroller import RADAR_DISABLE_FRAME, RADAR_ENABLE_TIMEOUT_FRAMES
+from opendbc.car.psa.carcontroller import LAUNCH_TORQUE, RADAR_DISABLE_FRAME, RADAR_ENABLE_TIMEOUT_FRAMES
 from opendbc.car.psa.carstate import RADAR_TIMEOUT_FRAMES
 
 DISABLE_RADAR = (0x6B6, b'\x02\x10\x02\x80\x00\x00\x00\x00')
@@ -248,10 +248,11 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.parser_2f6 = CANParser('psa_aee2010_r3', [('HS2_DYN_MDD_ETAT_2F6', 0)], PSA_ADAS_BUS)
 
   def step(self, long_active: bool, accel: float, brake_pressed: bool = False, gas_pressed: bool = False, cruise_enabled: bool = True,
-           standstill: bool = False, v_ego: float = 0.0):
+           standstill: bool = False, v_ego: float = 0.0, pitch: float = 0.0):
     CC = structs.CarControl()
     CC.longActive = long_active
     CC.actuators.accel = accel
+    CC.orientationNED = [0.0, pitch, 0.0]
 
     self.CI.update([])
     self.CI.CS.radar_alive = False
@@ -354,17 +355,18 @@ class TestPsaBrakeOverride(unittest.TestCase):
   def test_standstill_hold_and_drive_away(self):
     # the ESP holds the car at a stop for the radar and only releases after the stock
     # drive-away handshake: hold pattern (saturated -10.65 decel code, no wheel torque),
-    # DRIVE_AWAY_REQUEST pulsed in 0x2F6, then wheel torque with the decel request still
-    # active until the car is rolling
+    # DRIVE_AWAY_REQUEST pulsed in 0x2F6, then the launch — desired decel at the saturated
+    # positive end with the decel request still active, which is what the ESP lets go on
     self.knock_out()
     self.emulated(long_active=True, accel=-1.0, v_ego=1.0)
 
-    # stopped: hold pattern
+    # stopped: hold pattern, advertising the torque the powertrain is holding in reserve
     msg = self.emulated(long_active=True, accel=-0.2, standstill=True)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
     self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -10.65, places=1)
     self.assertEqual(int(msg['WHEEL_TORQUE_REQUEST']), 0)
     self.assertEqual(int(msg['ACC_STATUS']), 4)
+    self.assertGreaterEqual(msg['GMP_POTENTIAL_WHEEL_TORQUE'], LAUNCH_TORQUE)
 
     # planner wants to move: the pulse goes up while 0x2B6 stays in the hold pattern
     b6, f6 = self.emulated_pair(long_active=True, accel=0.3, standstill=True)
@@ -377,14 +379,39 @@ class TestPsaBrakeOverride(unittest.TestCase):
       b6, f6 = self.emulated_pair(long_active=True, accel=0.3, standstill=True)
     self.assertEqual(int(f6['DRIVE_AWAY_REQUEST']), 0)
     self.assertEqual(int(b6['WHEEL_TORQUE_REQUEST']), 1)
-    self.assertGreater(b6['GMP_WHEEL_TORQUE'], 0)
+    self.assertGreaterEqual(b6['GMP_WHEEL_TORQUE'], LAUNCH_TORQUE, "launched under the torque the ESP releases on")
     self.assertEqual(int(b6['MDD_DECEL_CONTROL_REQ']), 1)
-    self.assertAlmostEqual(b6['MDD_DESIRED_DECELERATION'], 1.0, places=1)
+    self.assertAlmostEqual(b6['MDD_DESIRED_DECELERATION'], 2.0, places=1)
 
     # rolling: back to the plain torque pattern
     b6, f6 = self.emulated_pair(long_active=True, accel=0.3, v_ego=1.0)
     self.assertEqual(int(b6['MDD_DECEL_CONTROL_REQ']), 0)
     self.assertEqual(int(b6['WHEEL_TORQUE_REQUEST']), 1)
+
+  def test_gas_press_ends_the_standstill_hold(self):
+    # the driver pulling away by pedal is an override: keeping the hold up against it left
+    # a decel request on the bus while the car crept forward and the ESP latched the fault
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.0, v_ego=1.0)
+    msg = self.emulated(long_active=True, accel=-0.2, standstill=True)
+    self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -10.65, places=1)
+
+    # gas press: longActive drops and accel is zeroed, cruise stays on
+    msg = self.emulated(long_active=False, accel=0.0, gas_pressed=True, standstill=True)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0, "held the ESP while the driver was on the pedal")
+    self.assertNotAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -10.65, places=1)
+    self.assertEqual(int(msg['ACC_STATUS']), 5)
+
+  def test_hold_releases_on_a_descent(self):
+    # the hold is driven by the planner's request, not the pitch-compensated one: on a
+    # descent gravity alone keeps the compensated value negative and the car would sit
+    # there however hard the planner asked to move
+    self.knock_out()
+    self.emulated(long_active=True, accel=-1.0, v_ego=1.0, pitch=-0.1)
+    self.emulated(long_active=True, accel=-0.2, standstill=True, pitch=-0.1)
+
+    b6, f6 = self.emulated_pair(long_active=True, accel=0.3, standstill=True, pitch=-0.1)
+    self.assertEqual(int(f6['DRIVE_AWAY_REQUEST']), 1, "hold never released on a downhill grade")
 
   def test_gas_override_suspends_acc_instead_of_turning_it_off(self):
     # a gas press drops longActive but cruise stays on; the stock radar advertises ACC

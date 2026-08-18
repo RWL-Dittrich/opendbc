@@ -39,14 +39,19 @@ def create_HS2_DYN1_MDD_ETAT_2B6(packer, frame: int, accel: float, decel_active:
                                  standstill_hold: bool = False, launching: bool = False):
   # TODO: check difference between GMP_POTENTIAL_WHEEL_TORQUE and GMP_WHEEL_TORQUE
 
-  # Stock standstill sequence, measured from a stock-radar drive coming to a stop behind a
-  # lead and creeping off again:
+  # Stock standstill sequence, measured across six stock-radar drive-aways from a stop
+  # behind a lead:
   #   hold:   decel request active with the saturated -10.65 hold code, potential torque
-  #           request 1, no wheel torque request
-  #   pulse:  DRIVE_AWAY_REQUEST goes up in 0x2F6 for ~0.8 s while this frame stays in the
-  #           hold pattern
-  #   launch: the wheel torque request comes up with the decel request *still active* and a
-  #           positive desired decel (~+1.0, decaying), until the car is rolling
+  #           request 1 carrying a real positive torque (700-1000 N.m), no wheel torque
+  #           request
+  #   pulse:  DRIVE_AWAY_REQUEST goes up in 0x2F6 for ~40 ms while this frame stays in the
+  #           hold pattern — sometimes skipped entirely
+  #   launch: desired decel steps to the saturated *positive* end of the signal (+2.0) with
+  #           the decel request still active and the wheel torque request up. That step is
+  #           what the ESP releases on: it cleared its ARRET_VHL_ADAS hold 70-100 ms later
+  #           in every stock case and rolled the brakes off over the next ~0.5 s. Sending
+  #           the launch with a mid-range desired decel (+1.0) instead left the ESP holding
+  #           through 1.4 s of rising wheel torque with the car not moving at all.
   #
   # While a deceleration request is active, ACC_STATUS must keep advertising active (4):
   # the stock radar holds the full active pattern after a driver brake press and then
@@ -58,10 +63,10 @@ def create_HS2_DYN1_MDD_ETAT_2B6(packer, frame: int, accel: float, decel_active:
   torque_mode = enabled and not decel_active and not standstill_hold
   decel_req = decel_active or standstill_hold or launching
   values = {
-    'MDD_DESIRED_DECELERATION': -10.65 if standstill_hold else 1.0 if launching else accel if decel_active else 2.05, # m/s², 2.05 is the field's idle value
+    'MDD_DESIRED_DECELERATION': -10.65 if standstill_hold else 2.0 if launching else accel if decel_active else 2.05, # m/s², 2.05 is the field's idle value
     'POTENTIAL_WHEEL_TORQUE_REQUEST': 2 if decel_active and not standstill_hold else (1 if enabled else 0),
     'MIN_TIME_FOR_DESIRED_GEAR': 6.2 if torque_mode or standstill_hold else 0.0,
-    'GMP_POTENTIAL_WHEEL_TORQUE': torque if torque_mode else -4000,
+    'GMP_POTENTIAL_WHEEL_TORQUE': torque if torque_mode or standstill_hold else -4000,
     'ACC_STATUS': 4 if decel_req else ((5 if gasPressed else 2 if brakePressed and not standstill else 4) if enabled else (2 if brakePressed else 3)),
     'GMP_WHEEL_TORQUE': torque if torque_mode else -4000,
     'WHEEL_TORQUE_REQUEST': 1 if torque_mode else 0, # TODO: test 1: high torque range 2: low torque range
