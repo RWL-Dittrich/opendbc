@@ -1,10 +1,14 @@
 import unittest
 
-from opendbc.can import CANParser
+import numpy as np
+
+from opendbc.can import CANParser, CANPacker
 from opendbc.car import DT_CTRL, structs
 from opendbc.car.car_helpers import interfaces
-from opendbc.car.psa.carcontroller import LAUNCH_TORQUE, RADAR_DISABLE_FRAME, RADAR_ENABLE_TIMEOUT_FRAMES
-from opendbc.car.psa.carstate import RADAR_TIMEOUT_FRAMES
+from opendbc.car.common.conversions import Conversions as CV
+from opendbc.car.psa.carcontroller import (DECEL_BUILD_RATE_V, LAUNCH_TORQUE, RADAR_DISABLE_FRAME,
+                                          RADAR_ENABLE_TIMEOUT_FRAMES)
+from opendbc.car.psa.carstate import CLUSTER_SETPOINT_OFFSET, RADAR_TIMEOUT_FRAMES
 
 DISABLE_RADAR = (0x6B6, b'\x02\x10\x02\x80\x00\x00\x00\x00')
 ENABLE_RADAR = (0x6B6, b'\x02\x10\x01\x80\x00\x00\x00\x00')
@@ -230,15 +234,8 @@ class TestPsaRadarRelease(unittest.TestCase):
       self.assertNotIn(0x6B6, self.addrs(self.step(radar_alive=True)))
 
 
-class TestPsaBrakeOverride(unittest.TestCase):
-  """The emulated radar must never invert its request when the driver takes over.
-
-  The PCM holds cruiseState.enabled up for ~80 ms after a driver brake press, but
-  controlsd zeroes actuators.accel as soon as longActive drops. Driving the emulation
-  off the PCM alone made those frames advertise an active ACC asking for *positive*
-  wheel torque while the car was still decelerating, and the ESP (UC_FREIN) latched
-  ACC_ETAT_DECEL_OR_ESP_STATUS = 3 within 30 ms.
-  """
+class PsaEmulationTest(unittest.TestCase):
+  """Harness for driving the radar emulation frame by frame and decoding what went out."""
 
   def setUp(self):
     self.CI = make_car_interface(alpha_long=True)
@@ -248,11 +245,12 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.parser_2f6 = CANParser('psa_aee2010_r3', [('HS2_DYN_MDD_ETAT_2F6', 0)], PSA_ADAS_BUS)
 
   def step(self, long_active: bool, accel: float, brake_pressed: bool = False, gas_pressed: bool = False, cruise_enabled: bool = True,
-           standstill: bool = False, v_ego: float = 0.0, pitch: float = 0.0):
+           standstill: bool = False, v_ego: float = 0.0, pitch: float = 0.0, lead_visible: bool = False, a_ego: float = 0.0):
     CC = structs.CarControl()
     CC.longActive = long_active
     CC.actuators.accel = accel
     CC.orientationNED = [0.0, pitch, 0.0]
+    CC.hudControl.leadVisible = lead_visible
 
     self.CI.update([])
     self.CI.CS.radar_alive = False
@@ -261,6 +259,7 @@ class TestPsaBrakeOverride(unittest.TestCase):
     self.CI.CS.out.gasPressed = gas_pressed
     self.CI.CS.out.standstill = standstill
     self.CI.CS.out.vEgo = v_ego
+    self.CI.CS.out.aEgo = a_ego
     _, can_sends = self.CI.apply(CC.as_reader(), self.CC_SP, self.now_nanos)
     self.now_nanos += int(DT_CTRL * 1e9)
     return can_sends
@@ -302,16 +301,33 @@ class TestPsaBrakeOverride(unittest.TestCase):
         return b6, self.parser_2f6.vl['HS2_DYN_MDD_ETAT_2F6']
     self.fail("emulation never transmitted 0x2B6")
 
+  def settled(self, **kwargs):
+    """Hold a request until the decel rate limiter has caught up with it, see DECEL_BUILD_RATE_CRUISE."""
+    for _ in range(int(4.0 / DT_CTRL)):
+      self.step(**kwargs)
+    return self.emulated(**kwargs)
+
+
+class TestPsaBrakeOverride(PsaEmulationTest):
+  """The emulated radar must never invert its request when the driver takes over.
+
+  The PCM holds cruiseState.enabled up for ~80 ms after a driver brake press, but
+  controlsd zeroes actuators.accel as soon as longActive drops. Driving the emulation
+  off the PCM alone made those frames advertise an active ACC asking for *positive*
+  wheel torque while the car was still decelerating, and the ESP (UC_FREIN) latched
+  ACC_ETAT_DECEL_OR_ESP_STATUS = 3 within 30 ms.
+  """
+
   def test_braking_frame_requests_deceleration(self):
     self.knock_out()
-    msg = self.emulated(long_active=True, accel=-1.25)
+    msg = self.settled(long_active=True, accel=-1.25)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
     self.assertAlmostEqual(msg['MDD_DESIRED_DECELERATION'], -1.25, places=1)
     self.assertEqual(int(msg['POTENTIAL_WHEEL_TORQUE_REQUEST']), 2, "not in brake mode")
 
   def test_driver_brake_never_inverts_into_a_torque_request(self):
     self.knock_out()
-    self.emulated(long_active=True, accel=-1.25)
+    self.settled(long_active=True, accel=-1.25)
 
     # driver brakes: longActive drops and accel is zeroed, but the PCM has not caught up yet
     msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
@@ -325,7 +341,7 @@ class TestPsaBrakeOverride(unittest.TestCase):
     # the same frame — a partial release (the off/suspended status with the decel request
     # still up, or the request cleared with a stale desired decel) latched the ESP fault
     self.knock_out()
-    self.emulated(long_active=True, accel=-1.6)
+    self.settled(long_active=True, accel=-1.6)
 
     msg = self.emulated(long_active=False, accel=0.0, brake_pressed=True, cruise_enabled=True)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0)
@@ -334,7 +350,7 @@ class TestPsaBrakeOverride(unittest.TestCase):
 
   def test_gas_release_is_atomic(self):
     self.knock_out()
-    self.emulated(long_active=True, accel=-1.6)
+    self.settled(long_active=True, accel=-1.6)
 
     msg = self.emulated(long_active=True, accel=-1.6, gas_pressed=True)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0)
@@ -346,7 +362,7 @@ class TestPsaBrakeOverride(unittest.TestCase):
     # must wait for the decel request to clear: one frame of ACC_STATUS 2 with the decel
     # request still up latched the ESP fault
     self.knock_out()
-    self.emulated(long_active=True, accel=-1.25)
+    self.settled(long_active=True, accel=-1.25)
 
     msg = self.emulated(long_active=True, accel=-1.25, brake_pressed=True)
     self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 1)
@@ -425,12 +441,125 @@ class TestPsaBrakeOverride(unittest.TestCase):
   def test_gas_and_brake_together_never_request_torque(self):
     # both pedals: the brake wins, the gas override must not keep the enabled pattern up
     self.knock_out()
-    self.emulated(long_active=True, accel=-1.25)
+    self.settled(long_active=True, accel=-1.25)
 
     msg = self.emulated(long_active=False, accel=0.0, gas_pressed=True, brake_pressed=True, cruise_enabled=True)
     self.assertNotEqual(int(msg['POTENTIAL_WHEEL_TORQUE_REQUEST']), 1)
     self.assertEqual(msg['GMP_WHEEL_TORQUE'], -4000)
     self.assertNotEqual(int(msg['ACC_STATUS']), 5, "kept ACC suspended while the driver was braking")
+
+
+class TestPsaDecelBuildRate(PsaEmulationTest):
+  """A deceleration request has to build at a rate the driver can feel coming.
+
+  The planner's cruise source steps. It is a P controller on speed error clipped at
+  -1.2 m/s², so any set-speed change over 4.3 km/h saturates it, and its own jerk limiter
+  runs while disengaged, leaving nothing to ramp: engaging above the set speed put -1.22
+  on the bus in the first active frame and the car pulled -1.46 m/s² 0.8 s later. The car
+  has no jerk signal to hand the ESP, so the shaping lives in the controller — see
+  DECEL_BUILD_RATE_CRUISE.
+  """
+
+  def ramp(self, target: float, frames: int, **kwargs):
+    """Hold a request for `frames` frames and return the limited value at each one."""
+    out = []
+    for _ in range(frames):
+      self.step(long_active=True, accel=target, **kwargs)
+      out.append(self.CI.CC.accel_last)
+    return out
+
+  def assert_build(self, target, **kwargs):
+    """Ramp to `target` and return how long it took, checking the rate was never exceeded."""
+    profile = self.ramp(target, 400, **kwargs)
+    self.assertGreaterEqual(min(np.diff([0.0] + profile)), -max(DECEL_BUILD_RATE_V) - 1e-9,
+                            "built faster than the fastest scheduled rate")
+    self.assertAlmostEqual(profile[-1], target, msg="never reached the request")
+    return next(i for i, a in enumerate(profile) if a <= target + 1e-9) * DT_CTRL
+
+  def test_comfort_braking_builds_slowly(self):
+    # everything the cruise clip can ask for lives in this band
+    self.knock_out()
+    self.assertGreater(self.assert_build(-1.2), 1.0, "the full request landed in under a second")
+
+  def test_a_lead_in_sight_is_still_comfort_braking(self):
+    # engaging behind a lead, or dropping the set speed with one in sight, asks for no more
+    # than cruise tracking does, and must not be treated as urgent
+    self.knock_out()
+    self.assertGreater(self.assert_build(-1.2, lead_visible=True), 1.0, "a visible lead skipped the comfort rate")
+
+  def test_a_hard_request_is_not_held_back(self):
+    # a lead braking hard or a cut-in: only the MPC or the model can ask this deep
+    self.knock_out()
+    self.assertLess(self.assert_build(-3.0), 1.0, "held back a request that needed to go out now")
+
+  def test_engaging_above_the_set_speed_does_not_step(self):
+    self.knock_out()
+    for _ in range(50):
+      self.step(long_active=False, accel=0.0, v_ego=30.0)
+
+    # first active frame with the planner already asking for the full cruise decel
+    msg = self.emulated(long_active=True, accel=-1.2, v_ego=30.0)
+    self.assertGreater(self.CI.CC.accel_last, -0.1, "landed the planner's saturated request in one frame")
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0, "asked the ESP for the brakes on the engage frame")
+
+  def test_the_cars_own_deceleration_is_not_re_ramped(self):
+    # coasting down or coming off the brake, there is nothing to ease into: the limiter is
+    # primed with aEgo while inactive so engaging picks up where the car already is
+    self.knock_out()
+    for _ in range(50):
+      self.step(long_active=False, accel=0.0, v_ego=30.0, a_ego=-1.0)
+
+    self.step(long_active=True, accel=-1.2, v_ego=30.0, a_ego=-1.0)
+    self.assertLess(self.CI.CC.accel_last, -1.0, "made the driver wait through a ramp the car was already past")
+
+  def test_release_and_acceleration_are_never_limited(self):
+    # the ESP needs the hand-back in the frame it is asked for, and a rate limit on the way
+    # out is what made braking feel like it came in steps — see the reverted DECEL_RELEASE_RATE
+    self.knock_out()
+    self.settled(long_active=True, accel=-1.2)
+
+    msg = self.emulated(long_active=True, accel=0.0)
+    self.assertEqual(self.CI.CC.accel_last, 0.0)
+    self.assertEqual(int(msg['MDD_DECEL_CONTROL_REQ']), 0, "held a deceleration request after it was released")
+
+    self.step(long_active=True, accel=1.0)
+    self.assertEqual(self.CI.CC.accel_last, 1.0, "rate limited the accelerator")
+
+
+class TestPsaClusterSetSpeed(unittest.TestCase):
+  """openpilot's set speed has to read the same as the number on the dash.
+
+  The bus carries a setpoint 2 km/h below the displayed one, which is what the car regulates
+  to, so the display is corrected and the control target is left alone — see
+  CLUSTER_SETPOINT_OFFSET.
+  """
+
+  def setUp(self):
+    self.CI = make_car_interface(alpha_long=True)
+    self.packer = CANPacker('psa_aee2010_r3')
+    self.now_nanos = 0
+
+  def setpoint(self, kph: int):
+    """Put SPEED_SETPOINT on the ADAS bus and return the resulting CarState."""
+    values = {'SPEED_SETPOINT': kph, 'RVV_ACC_ACTIVATION_REQ': 1}
+    for _ in range(3):  # the parser wants a few frames before the values come through
+      self.now_nanos += int(DT_CTRL * 1e9)
+      msg = self.packer.make_can_msg('HS2_DAT_MDD_CMD_452', PSA_ADAS_BUS, values)
+      CS, _ = self.CI.update([(self.now_nanos, [msg])])
+    return CS
+
+  def test_cluster_set_speed_matches_the_dash(self):
+    for kph in (50, 82, 130):
+      CS = self.setpoint(kph)
+      self.assertAlmostEqual(CS.cruiseState.speed * CV.MS_TO_KPH, kph, places=3,
+                             msg="control target no longer follows the value the car regulates to")
+      self.assertAlmostEqual(CS.cruiseState.speedCluster * CV.MS_TO_KPH, kph + CLUSTER_SETPOINT_OFFSET, places=3,
+                             msg="the displayed set speed is a step off the dash")
+
+  def test_no_offset_with_acc_off(self):
+    # the signal parks at 255 with ACC off, and 257 is not a set speed anyone should be shown
+    CS = self.setpoint(255)
+    self.assertEqual(CS.cruiseState.speedCluster, CS.cruiseState.speed)
 
 
 if __name__ == "__main__":

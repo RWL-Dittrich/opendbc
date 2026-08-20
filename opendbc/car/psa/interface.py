@@ -51,6 +51,6 @@ class CarInterface(CarInterfaceBase):
     ret.longitudinalActuatorDelay = 0.25
 
     ret.longitudinalTuning.kiBP = [0.]
-    ret.longitudinalTuning.kiV = [0.5]
+    ret.longitudinalTuning.kiV = [1.0]
 
     return ret

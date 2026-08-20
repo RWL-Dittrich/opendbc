@@ -42,6 +42,28 @@ LAUNCH_COMPLETE_SPEED = 0.5  # m/s, decel request released above this
 # command, below anything the stock radar was seen to use to get the car moving.
 LAUNCH_TORQUE = 600  # N.m
 
+# The planner's cruise source is a plain P controller on speed error clipped at
+# A_CRUISE_MIN, so a 4.3 km/h set-speed step already saturates it at -1.2 m/s², and its own
+# jerk limiter runs while disengaged too — measured pinned at -1.20 for the whole second
+# before an engage frame, so engaging above the set speed landed the full request in one
+# frame (-1.22 commanded, -1.46 m/s² achieved 0.8 s later). PSA has no jerk or gradient
+# signal to hand the ESP the way Tesla, VW and Hyundai do, so the request is shaped here
+# instead, like Ford and Honda. Only the build is limited: a release still goes out in the
+# frame it is asked for, the ESP needs an atomic hand-back.
+# The rate is scheduled on how deep the request is, not on whether there is a lead: engaging
+# behind one, or dropping the set speed with one in sight, is the same comfort case as an empty
+# road. The cruise clip can never ask past -1.2 m/s², so that whole band is comfort braking and
+# builds slowly, while a request only the MPC or the model can produce — a lead braking hard, a
+# cut-in — is let through at Ford's 3.5 m/s³ (Ford notes the stock system does 5).
+# Holding the request back winds up LongControl's integrator: its error is the planner's aTarget
+# against aEgo, so it keeps integrating what we refuse to deliver, and actuators.accel arrives
+# deeper than the plan by roughly ki * 0.5 * (request / rate) — about 0.35 m/s² for a -1.2 m/s²
+# request at the slow end with kiV 0.5, twice that at kiV 1.0. It decays as soon as the ramp
+# catches up. The lower breakpoint is kept clear of that band so wind-up alone cannot unlock the
+# fast rate; raise the slow end if the overshoot is felt on the road.
+DECEL_BUILD_RATE_BP = [-2.5, -1.5]   # m/s², the request being built toward
+DECEL_BUILD_RATE_V = [0.035, 0.010]  # m/s² per 100 Hz frame, 3.5 and 1.0 m/s³
+
 # CMM (the engine ECU) takes a wheel-torque request, not an acceleration, so this map is
 # the conversion the stock radar would have done. Calibrated against measured accel from
 # the LongitudinalManeuverMode suite — see helper-scripts/accel_map.py, which imports
@@ -77,6 +99,7 @@ class CarController(CarControllerBase):
     self.hold = False
     self.launching = False
     self.drive_away_frames = 0
+    self.accel_last = 0.0
 
     # Vehicle model used for lateral limiting
     self.VM = VehicleModel(get_safety_CP())
@@ -143,7 +166,19 @@ class CarController(CarControllerBase):
     # <-0.5: Add friction brakes
     pitch = CC.orientationNED[1] if len(CC.orientationNED) == 3 else 0.0
     accel_slope = math.sin(pitch) * 9.81
-    accel_cmd = actuators.accel + accel_slope
+
+    # rate-limit how fast a deceleration request may build, see DECEL_BUILD_RATE_BP
+    if CC.longActive:
+      build_rate = interp(actuators.accel, DECEL_BUILD_RATE_BP, DECEL_BUILD_RATE_V)
+      self.accel_last = max(actuators.accel, self.accel_last - build_rate)
+      accel = self.accel_last
+    else:
+      # keep the limiter primed with the car's own deceleration so the next engage builds
+      # from what the car is doing, but never from a positive value, and leave the request
+      # itself at the planner's zero so the gas-override torque path is unchanged
+      self.accel_last = min(CS.out.aEgo, 0.0)
+      accel = actuators.accel
+    accel_cmd = accel + accel_slope
 
     brake_accel = -0.5
 

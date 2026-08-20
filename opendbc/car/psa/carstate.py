@@ -21,6 +21,12 @@ RADAR_MSG = 'HS2_DYN1_MDD_ETAT_2B6'
 # gap, and holds the total silence to ~70 ms.
 RADAR_TIMEOUT_FRAMES = 6
 
+# SPEED_SETPOINT reads 2 km/h below the set speed shown on the dash — driver-observed, and the
+# same at every set speed. The car regulates to the value on the bus, absorbing the speedometer's
+# over-read, so that value stays the control target and only the cluster display is corrected;
+# without this openpilot's own set speed sits a step below the dash's for the whole drive.
+CLUSTER_SETPOINT_OFFSET = 2  # km/h
+
 class CarState(CarStateBase):
   def __init__(self, CP, CP_SP):
     super().__init__(CP, CP_SP)
@@ -66,7 +72,10 @@ class CarState(CarStateBase):
     self.eps_active = cp.vl['IS_DAT_DIRA']['EPS_STATE_LKA'] == 3 # 0: Unauthorized, 1: Authorized, 2: Available, 3: Active, 4: Defect
 
     # cruise
-    ret.cruiseState.speed = cp_adas.vl['HS2_DAT_MDD_CMD_452']['SPEED_SETPOINT'] * CV.KPH_TO_MS # set to 255 when ACC is off, -2 kph offset from dash speed
+    setpoint = cp_adas.vl['HS2_DAT_MDD_CMD_452']['SPEED_SETPOINT']  # set to 255 when ACC is off
+    ret.cruiseState.speed = setpoint * CV.KPH_TO_MS
+    # show what the dash shows, see CLUSTER_SETPOINT_OFFSET; with ACC off there is nothing to offset
+    ret.cruiseState.speedCluster = (setpoint + CLUSTER_SETPOINT_OFFSET) * CV.KPH_TO_MS if setpoint < 255 else ret.cruiseState.speed
     ret.cruiseState.enabled = cp_adas.vl['HS2_DAT_MDD_CMD_452']['RVV_ACC_ACTIVATION_REQ'] == 1
     ret.cruiseState.available = True # not available for CC-only
     ret.cruiseState.nonAdaptive = False # not available for CC-only
